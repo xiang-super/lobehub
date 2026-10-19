@@ -3,10 +3,35 @@ import type { ConversationContext, UploadFileItem } from '@lobechat/types';
 import { operationSelectors } from '@/store/chat/slices/operation/selectors';
 import {
   mergeQueuedMessages,
+  type QueuedMessage,
   reconstructUploadFilesFromQueue,
 } from '@/store/chat/slices/operation/types';
 import type { ChatStore } from '@/store/chat/store';
 import { messageMapKey } from '@/store/chat/utils/messageMapKey';
+
+/** Send drained queued messages as one steered turn. */
+export const sendQueuedMessages = (
+  get: () => ChatStore,
+  context: ConversationContext,
+  messages: QueuedMessage[],
+): Promise<unknown> => {
+  const merged = mergeQueuedMessages(messages);
+  const mergedFiles =
+    merged.filesPreview.length > 0
+      ? reconstructUploadFilesFromQueue(merged.filesPreview)
+      : merged.files.length > 0
+        ? (merged.files.map((id) => ({ id })) as UploadFileItem[])
+        : undefined;
+
+  return get().sendMessage({
+    context,
+    editorData: merged.editorData,
+    files: mergedFiles,
+    ...(merged.forceRuntime ? { forceRuntime: merged.forceRuntime } : {}),
+    message: merged.content,
+    metadata: { ...merged.metadata, steer: true },
+  });
+};
 
 /** Shared by streamed completion and recovery from a server terminal snapshot. */
 export const scheduleQueuedFollowUp = (
@@ -28,25 +53,8 @@ export const scheduleQueuedFollowUp = (
       return;
     }
 
-    const merged = mergeQueuedMessages(remainingQueued);
-    const mergedFiles =
-      merged.filesPreview.length > 0
-        ? reconstructUploadFilesFromQueue(merged.filesPreview)
-        : merged.files.length > 0
-          ? (merged.files.map((id) => ({ id })) as UploadFileItem[])
-          : undefined;
-
-    get()
-      .sendMessage({
-        context: execContext,
-        editorData: merged.editorData,
-        files: mergedFiles,
-        ...(merged.forceRuntime ? { forceRuntime: merged.forceRuntime } : {}),
-        message: merged.content,
-        metadata: { ...merged.metadata, steer: true },
-      })
-      .catch((error: unknown) => {
-        console.error('[executeClientAgent] sendMessage for queued content failed:', error);
-      });
+    sendQueuedMessages(get, execContext, remainingQueued).catch((error: unknown) => {
+      console.error('[executeClientAgent] sendMessage for queued content failed:', error);
+    });
   }, 100);
 };

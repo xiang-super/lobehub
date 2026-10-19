@@ -78,17 +78,19 @@ import { selectRuntimeType } from '@/store/chat/slices/agentRun/actions/dispatch
 import { executeDirectMention } from '@/store/chat/slices/agentRun/actions/dispatch/directMentionExecutor';
 import { resolveNewThreadIntent } from '@/store/chat/slices/agentRun/actions/dispatch/newThreadIntent';
 import { buildRunLifecycle } from '@/store/chat/slices/agentRun/actions/lifecycle/buildRunLifecycle';
+import { sendQueuedMessages } from '@/store/chat/slices/agentRun/actions/lifecycle/queuedFollowUp';
 import type { RunScope } from '@/store/chat/slices/agentRun/actions/lifecycle/types';
+import { buildQueuedFollowUpRequest } from '@/store/chat/slices/agentRun/actions/transports/gateway/execRequest';
+import {
+  canQueueOnServer,
+  handOffQueuedMessage,
+  reclaimServerQueuedMessages,
+} from '@/store/chat/slices/agentRun/actions/transports/gateway/serverSteerQueue';
 import {
   getNativeHeteroSessionBindingKey,
   resolveHeteroResume,
 } from '@/store/chat/slices/agentRun/actions/transports/hetero/heteroResume';
-import type { QueuedFile } from '@/store/chat/slices/operation/types';
-import {
-  isQueueBlockingOperation,
-  mergeQueuedMessages,
-  reconstructUploadFilesFromQueue,
-} from '@/store/chat/slices/operation/types';
+import { isQueueBlockingOperation, snapshotQueuedFiles } from '@/store/chat/slices/operation/types';
 import { PortalViewType } from '@/store/chat/slices/portal/initialState';
 import { chatPortalSelectors } from '@/store/chat/slices/portal/selectors';
 import { resolveTopicHeteroPin } from '@/store/chat/slices/topic/selectors';
@@ -796,35 +798,48 @@ export class ConversationLifecycleActionImpl {
       !onlyAddUserMessage &&
       operationSelectors.isQueueDrainPending(operationContext)(this.#get());
     if (runningQueueBlockingOp || queueDrainPending) {
-      // Snapshot file previews so the tray can render thumbnails AND the
-      // resumed sendMessage can rebuild audioList/imageList/videoList — by the time
-      // we drain, chatUploadFileList has long been cleared.
-      const filesPreview: QueuedFile[] = (files ?? []).map((f) => ({
-        audioMetadata: f.audioMetadata,
-        id: f.id,
-        mimeType: f.file?.type ?? '',
-        name: f.file?.name ?? f.id,
-        url: f.fileUrl || f.base64Url || f.previewUrl || '',
-      }));
-
+      const queuedId = nanoid();
+      // Behind a Gateway run the server keeps the follow-up, so the run can join it.
+      const queueOnServer =
+        !onlyAddUserMessage &&
+        canQueueOnServer(this.#get, queueTargetKey, {
+          context: operationContext,
+          isGatewayRun: runtimeType === 'gateway' && !directMentionRoute && !willCreateNewTopic,
+        });
       this.#get().enqueueMessage(
         queueTargetKey,
         {
-          id: nanoid(),
+          id: queuedId,
           content: message,
           editorData: editorData ?? undefined,
           files: fileIdList,
-          filesPreview: filesPreview.length > 0 ? filesPreview : undefined,
+          filesPreview: snapshotQueuedFiles(files),
           ...(forceRuntime ? { forceRuntime } : {}),
           interruptMode: 'soft',
           metadata: userMessageMetadata,
           createdAt: Date.now(),
+          ...(queueOnServer && { serverDelivery: 'appending' as const }),
         },
         runningQueueBlockingOp?.id,
       );
+      if (queueOnServer)
+        void handOffQueuedMessage(this.#get, queueTargetKey, operationContext, queuedId, () =>
+          buildQueuedFollowUpRequest(this.#get, {
+            context: operationContext,
+            fileIds: fileIdList,
+            mentionedAgents: hasMentionedAgents ? mentionedAgents : undefined,
+            message,
+            selectedSkillIds: selectedSkills.map((skill) => skill.identifier),
+            selectedToolIds: selectedTools.map((tool) => tool.identifier),
+            trigger: requestTrigger,
+          }),
+        );
       notifyMessageAccepted();
       return;
     }
+
+    // A stopped run starts nothing next: take its follow-ups back from the server.
+    await Promise.all(queueCandidateKeys.map((key) => reclaimServerQueuedMessages(this.#get, key)));
 
     // Stop may already have moved the old operation to `cancelled`, so there is
     // no live blocker left to drain follow-ups that were queued before Stop.
@@ -838,45 +853,24 @@ export class ConversationLifecycleActionImpl {
       });
     });
     if (orphanedQueueKey && !onlyAddUserMessage) {
-      const filesPreview: QueuedFile[] = (files ?? []).map((file) => ({
-        audioMetadata: file.audioMetadata,
-        id: file.id,
-        mimeType: file.file?.type ?? '',
-        name: file.file?.name ?? file.id,
-        url: file.fileUrl || file.base64Url || file.previewUrl || '',
-      }));
       this.#get().enqueueMessage(orphanedQueueKey, {
         content: message,
         createdAt: Date.now(),
         editorData: editorData ?? undefined,
         files: fileIdList,
-        filesPreview: filesPreview.length > 0 ? filesPreview : undefined,
+        filesPreview: snapshotQueuedFiles(files),
         ...(forceRuntime ? { forceRuntime } : {}),
         id: nanoid(),
         interruptMode: 'soft',
         metadata: userMessageMetadata,
       });
-      const merged = mergeQueuedMessages(this.#get().drainQueuedMessages(orphanedQueueKey));
+      const restarted = this.#get().drainQueuedMessages(orphanedQueueKey);
       notifyMessageAccepted();
 
       setTimeout(() => {
-        this.#get()
-          .sendMessage({
-            context: operationContext,
-            editorData: merged.editorData,
-            files:
-              merged.filesPreview.length > 0
-                ? reconstructUploadFilesFromQueue(merged.filesPreview)
-                : merged.files.length > 0
-                  ? (merged.files.map((id) => ({ id })) as any)
-                  : undefined,
-            ...(merged.forceRuntime ? { forceRuntime: merged.forceRuntime } : {}),
-            message: merged.content,
-            metadata: { ...merged.metadata, steer: true },
-          })
-          .catch((error: unknown) => {
-            console.error('[sendMessage] restarting queued content after Stop failed:', error);
-          });
+        sendQueuedMessages(this.#get, operationContext, restarted).catch((error: unknown) => {
+          console.error('[sendMessage] restarting queued content after Stop failed:', error);
+        });
       }, 0);
 
       return;

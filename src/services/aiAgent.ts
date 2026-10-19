@@ -189,6 +189,29 @@ export interface ExecAgentTaskParams {
 }
 
 /**
+ * A composer send queued behind the running turn on the server: the
+ * fresh-send part of {@link ExecAgentTaskParams}.
+ */
+export type QueuedFollowUpRequest = Omit<
+  ExecAgentTaskParams,
+  | 'autoStart'
+  | 'clientIds'
+  | 'clientOperations'
+  | 'existingMessageIds'
+  | 'parentMessageId'
+  | 'replacesOperationId'
+  | 'resumeApproval'
+  | 'resumeApprovals'
+  | 'resumeToolResult'
+  | 'steer'
+>;
+
+export interface QueuedFollowUpSurface {
+  threadId?: string | null;
+  topicId: string;
+}
+
+/**
  * Parameters for execSubAgentTask
  * Supports both Group mode (with groupId) and Single Agent mode (without groupId)
  */
@@ -306,6 +329,37 @@ class AiAgentService {
       },
       options,
     );
+  }
+
+  /**
+   * Queue a follow-up behind the surface's running turn on the server. It
+   * carries the same run declarations as {@link execAgentTask}, so the run can
+   * tell whether the follow-up can join it. `queued: false` means nothing was
+   * stored and this client must send it itself.
+   */
+  async appendQueuedFollowUp(params: { id: string; request: QueuedFollowUpRequest }) {
+    const clientProtocol = canUseGatewayProtocolV2() ? CLIENT_PROTOCOL_VERSION : undefined;
+    const llmExecutor = buildLlmExecutorDeclaration();
+
+    return await lambdaClient.agentSteerQueue.append.mutate({
+      id: params.id,
+      request: {
+        clientProtocol,
+        ...(llmExecutor && { llmExecutor }),
+        ...params.request,
+        streamFeatures: STREAM_FEATURES,
+      },
+    });
+  }
+
+  /** This user's follow-ups still waiting on the server, oldest first. */
+  async listQueuedFollowUps(surface: QueuedFollowUpSurface) {
+    return await lambdaClient.agentSteerQueue.list.query(surface);
+  }
+
+  /** `removed: false` means the follow-up already left the queue to be delivered. */
+  async removeQueuedFollowUp(params: QueuedFollowUpSurface & { id: string }) {
+    return await lambdaClient.agentSteerQueue.remove.mutate(params);
   }
 
   /**

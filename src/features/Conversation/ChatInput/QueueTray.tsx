@@ -1,6 +1,6 @@
 'use client';
 
-import { ActionIcon, createStaticStyles, Flexbox, Icon, Image, Tooltip } from '@lobehub/ui';
+import { ActionIcon, createStaticStyles, Flexbox, Icon, Image, toast, Tooltip } from '@lobehub/ui';
 import { ArrowUp, Info, ListEnd, Pencil, Trash2 } from 'lucide-react';
 import { memo, useCallback, useMemo } from 'react';
 import { useTranslation } from 'react-i18next';
@@ -202,7 +202,7 @@ const QueueTray = memo(() => {
   );
 
   const queuedMessages = useChatStore((s) => operationSelectors.getQueuedMessages(context)(s));
-  const removeQueuedMessage = useChatStore((s) => s.removeQueuedMessage);
+  const withdrawQueuedMessage = useChatStore((s) => s.withdrawQueuedMessage);
   const dispatchChatUploadFileList = useFileStore((s) => s.dispatchChatUploadFileList);
   const editor = useConversationStore((s) => s.editor);
   const sendNowGate = useSingleton(createQueueSendNowGate);
@@ -211,9 +211,24 @@ const QueueTray = memo(() => {
   // input area, so the user can tweak the message and re-send. Without the
   // file restore, images attached to a queued message would silently disappear
   // when the user clicks the pencil.
+  // A follow-up queued on the server may already be on its way into the run;
+  // then it is neither edited nor sent again.
+  const withdraw = useCallback(
+    async (msg: QueuedMessage) => {
+      const withdrawn = await withdrawQueuedMessage(contextKey, msg.id).catch((error) => {
+        console.error('[QueueTray] withdrawing a queued message failed:', error);
+        toast.error(t('inputQueue.withdrawFailed'));
+        return undefined;
+      });
+      if (withdrawn === false) toast.info(t('inputQueue.alreadyDelivered'));
+      return !!withdrawn;
+    },
+    [contextKey, t, withdrawQueuedMessage],
+  );
+
   const handleEdit = useCallback(
-    (msg: QueuedMessage) => {
-      removeQueuedMessage(contextKey, msg.id);
+    async (msg: QueuedMessage) => {
+      if (!(await withdraw(msg))) return;
       editor?.setDocument('markdown', msg.content);
       editor?.focus();
       if (msg.filesPreview?.length) {
@@ -221,7 +236,7 @@ const QueueTray = memo(() => {
         dispatchChatUploadFileList({ files: restored, type: 'addFiles' });
       }
     },
-    [contextKey, dispatchChatUploadFileList, editor, removeQueuedMessage],
+    [dispatchChatUploadFileList, editor, withdraw],
   );
 
   // "Send now": cancel the currently running agent run for this context, then
@@ -249,8 +264,7 @@ const QueueTray = memo(() => {
           if (cancellationConfirmed.some((confirmed) => !confirmed)) {
             throw new Error('Running agent cancellation was not confirmed');
           }
-          removeQueuedMessage(contextKey, msg.id);
-
+          if (!(await withdraw(msg))) return;
           // Reconstruct UploadFileItem-shaped objects so the optimistic temp message
           // can rebuild imageList/videoList from the snapshotted preview metadata.
           const filesArray = msg.filesPreview?.length
@@ -268,7 +282,7 @@ const QueueTray = memo(() => {
         })
         .catch((error) => console.error('[QueueTray] sendNow failed:', error));
     },
-    [context, contextKey, removeQueuedMessage, sendNowGate],
+    [context, sendNowGate, withdraw],
   );
 
   if (queuedMessages.length === 0) return null;
@@ -351,7 +365,7 @@ const QueueTray = memo(() => {
               icon={Trash2}
               size="small"
               title={t('inputQueue.delete')}
-              onClick={() => removeQueuedMessage(contextKey, msg.id)}
+              onClick={() => withdraw(msg)}
             />
           </Flexbox>
         );
