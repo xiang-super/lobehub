@@ -359,6 +359,17 @@ export async function createOperation(
           : undefined,
         mirrorToOperationId,
         modelRuntimeConfig: withoutFrozenModelFacts(modelRuntimeConfig),
+        // Lets the gateway's per-user feed say which topic this run belongs to,
+        // so a tab that did not start it (a background sub-agent waking its
+        // parent) can follow it live.
+        routing: {
+          agentId: appContext?.agentId,
+          groupId: appContext?.groupId ?? undefined,
+          parentOperationId: parentOperationId ?? undefined,
+          scope: appContext?.scope ?? undefined,
+          threadId: appContext?.threadId ?? undefined,
+          topicId: appContext?.topicId ?? undefined,
+        },
         // Share-visitor runs execute as the creator (`userId`) but stream only
         // to the visitor — the gateway registers the WS channel under this id.
         streamOwnerUserId: agentShareVisitor?.visitorUserId,

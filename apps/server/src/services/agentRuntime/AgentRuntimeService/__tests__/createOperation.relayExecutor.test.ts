@@ -303,6 +303,7 @@ describe('AgentRuntimeService', () => {
       expect(mockCoordinator.createAgentOperation).toHaveBeenCalledWith('test-operation-1', {
         agentConfig: mockParams.agentConfig,
         modelRuntimeConfig: mockParams.modelRuntimeConfig,
+        routing: {},
         userId: mockParams.userId,
       });
 
@@ -314,6 +315,27 @@ describe('AgentRuntimeService', () => {
         priority: 'high',
         delay: 50,
       });
+    });
+
+    // The gateway feed uses it to tell a tab which topic a run it did not start belongs to.
+    it('hands the run routing to the operation init', async () => {
+      await service.createOperation({
+        ...mockParams,
+        appContext: { agentId: 'agt-1', threadId: 'thd-1', topicId: 'tpc-1' },
+        parentOperationId: 'op-parent',
+      } as any);
+
+      expect(mockCoordinator.createAgentOperation).toHaveBeenCalledWith(
+        'test-operation-1',
+        expect.objectContaining({
+          routing: {
+            agentId: 'agt-1',
+            parentOperationId: 'op-parent',
+            threadId: 'thd-1',
+            topicId: 'tpc-1',
+          },
+        }),
+      );
     });
 
     it('freezes the builder editing target on the run origin', async () => {
