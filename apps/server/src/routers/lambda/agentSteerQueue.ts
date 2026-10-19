@@ -126,6 +126,10 @@ export const agentSteerQueueRouter = router({
     // still delivered (or was), so the client must never send it too.
     if (input.id) {
       const state = await redisService.steerQueue.entryState(scope, input.id);
+      // A configured Redis that cannot be read: an earlier try may be stored,
+      // and the run may have ended since — neither "queued" nor "send directly".
+      if (!state && redisService.steerQueue.isConfigured())
+        throw new TRPCError({ code: 'SERVICE_UNAVAILABLE', message: 'Queue unavailable' });
       if (state === 'queued') return { id: input.id, length: 1, queued: true as const };
       if (state === 'delivering' || state === 'taken')
         return { id: input.id, length: 0, queued: true as const };
@@ -217,6 +221,8 @@ export const agentSteerQueueRouter = router({
     });
 
     const scope = toScope(input, ctx.userId);
+    // Without Redis in this deployment nothing is ever queued.
+    if (!redisService.steerQueue.isConfigured()) return [];
     let snapshot: { delivering: QueuedFollowUp[]; waiting: QueuedFollowUp[] };
     try {
       snapshot = await redisService.steerQueue.snapshot<QueuedFollowUp>(scope);

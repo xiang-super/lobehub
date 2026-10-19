@@ -229,8 +229,28 @@ describe('agentSteerQueueRouter.append', () => {
     await expect(caller().append(appendInput)).resolves.toEqual({ queued: false, reason });
   });
 
+  // ROOT CAUSE:
+  //
+  // A retried append whose earlier try may be stored looked its id up first,
+  // but a configured Redis that could not be read fell through to the liveness
+  // check: with the run ended it answered `idle`, and the client sent its copy
+  // while the first one could still run later.
+  //
+  // Before: an unreadable lookup counted as "not there".
+  // After: it is an unknown outcome, whatever the run.
+  it('answers unknown when the retry lookup cannot read a configured Redis', async () => {
+    mocks.entryState.mockResolvedValue(undefined);
+    mocks.liveCandidates.mockReturnValue([]);
+
+    await expect(caller().append(appendInput)).rejects.toMatchObject({
+      code: 'SERVICE_UNAVAILABLE',
+    });
+    expect(mocks.append).not.toHaveBeenCalled();
+  });
+
   it('sends directly where the deployment has no Redis at all', async () => {
     mocks.isConfigured.mockReturnValue(false);
+    mocks.entryState.mockResolvedValue(undefined);
     mocks.append.mockResolvedValue(undefined);
 
     await expect(caller().append(appendInput)).resolves.toEqual({
@@ -259,6 +279,7 @@ describe('agentSteerQueueRouter.append', () => {
 describe('agentSteerQueueRouter.list / remove', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mocks.isConfigured.mockReturnValue(true);
     mocks.snapshot.mockResolvedValue({
       delivering: [],
       waiting: [
@@ -325,6 +346,13 @@ describe('agentSteerQueueRouter.list / remove', () => {
     await expect(caller().remove({ id: 'mine', topicId: 'tpc-1' })).rejects.toMatchObject({
       code: 'SERVICE_UNAVAILABLE',
     });
+  });
+
+  it('lists nothing, without an error, where the deployment has no Redis', async () => {
+    mocks.isConfigured.mockReturnValue(false);
+
+    await expect(caller().list({ topicId: 'tpc-1' })).resolves.toEqual([]);
+    expect(mocks.snapshot).not.toHaveBeenCalled();
   });
 
   it('refuses to list while Redis is out, rather than reporting an empty queue', async () => {

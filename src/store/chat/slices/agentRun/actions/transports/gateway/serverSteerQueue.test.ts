@@ -529,6 +529,25 @@ describe('restoreServerQueuedMessages', () => {
     expect(queue()).toEqual([expect.objectContaining({ content: 'later', id: 'q1' })]);
   });
 
+  // ROOT CAUSE:
+  //
+  // Restoring was skipped when Gateway mode was off, though entries accepted
+  // while it was on stay up to a day: turning it off (or a rollout change) left
+  // them invisible and impossible to withdraw, still able to run.
+  //
+  // Before: restore required Gateway mode to be on now.
+  // After: it reads the owner's queue regardless.
+  it('restores follow-ups accepted earlier even with Gateway mode now off', async () => {
+    useChatStore.setState({ isGatewayModeEnabled: () => false });
+    vi.spyOn(aiAgentService, 'listQueuedFollowUps')
+      .mockResolvedValueOnce([pending('q1', { prompt: 'earlier' })])
+      .mockResolvedValue([]);
+
+    await restoreServerQueuedMessages(get, context);
+
+    expect(queue()).toEqual([expect.objectContaining({ content: 'earlier', id: 'q1' })]);
+  });
+
   it('adds nothing twice and stays out of threads', async () => {
     const list = vi
       .spyOn(aiAgentService, 'listQueuedFollowUps')

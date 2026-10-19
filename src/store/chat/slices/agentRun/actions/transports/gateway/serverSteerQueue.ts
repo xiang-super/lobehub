@@ -391,9 +391,9 @@ export const restoreServerQueuedMessages = async (
 ): Promise<void> => {
   const { agentId, topicId } = context;
   if (!agentId || !topicId) return;
+  // Not gated on Gateway mode being on now: entries accepted while it was stay
+  // up to a day and must remain visible and withdrawable after it is turned off.
   if (context.threadId || context.agentShareId || context.topicShareId) return;
-  // Only a Gateway conversation ever queues on the server.
-  if (!get().isGatewayModeEnabled?.(agentId)) return;
 
   const surface = { threadId: null, topicId };
   const pending = await listWithRetry(surface);
