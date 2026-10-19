@@ -149,6 +149,16 @@ return length
 /** KEYS[1] = queue */
 const LIST_SCRIPT = `return redis.call('LRANGE', KEYS[1], 0, -1)`;
 
+/** Every entry in a drained batch. KEYS[1] = drained batches */
+const IN_FLIGHT_SCRIPT = `${LUA_HELPERS}
+local out = {}
+for _, batch in ipairs(redis.call('HVALS', KEYS[1])) do
+  local _, items = splitBatch(batch)
+  for _, item in ipairs(items) do table.insert(out, item) end
+end
+return out
+`;
+
 /**
  * Entries a run would take: queued ones it owns, plus any in a lapsed batch
  * (they go back unbound on the next drain).
@@ -458,6 +468,17 @@ export const steerQueue = {
     if (!redis) return [];
 
     return parseEntries<T>(await redis.eval<unknown>(LIST_SCRIPT, 1, keyOf(scope)));
+  },
+
+  /**
+   * Entries a drain took that are not settled yet: on their way into a run, or
+   * back to the queue should that fail (also when their lease lapses).
+   */
+  async delivering<T extends SteerQueueEntry>(scope: SteerQueueScope): Promise<T[]> {
+    const redis = await getClient();
+    if (!redis) return [];
+
+    return parseEntries<T>(await redis.eval<unknown>(IN_FLIGHT_SCRIPT, 1, drainedKeyOf(scope)));
   },
 
   /**

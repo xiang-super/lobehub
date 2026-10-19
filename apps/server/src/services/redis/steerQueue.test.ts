@@ -81,6 +81,8 @@ const createFakeRedis = () => {
       return list.filter((item) => takes(item, op)).length + lapsed;
     }
     if (script.includes('return inFlight(KEYS[1])')) return inFlight(key);
+    if (script.includes('local out = {}'))
+      return [...batchesOf(key).values()].flatMap((batch) => batch.items);
     if (script.includes('SISMEMBER')) {
       const [id, item, ttl, max] = args;
       if (setOf(keys[1]).has(id)) return -2;
@@ -146,6 +148,23 @@ describe('redisService.steerQueue', () => {
 
     await q.settle(scope, 'd1');
     await expect(q.boundOperations(scope)).resolves.toMatchObject({ total: 0 });
+  });
+
+  it('shows a drained entry as delivering until its batch is settled', async () => {
+    await q.append(scope, entry('a'), 'op-1');
+    await q.append(scope, entry('b'), 'op-1');
+    await q.drain(scope, 'op-1', [], 'd1');
+
+    await expect(q.delivering(scope)).resolves.toEqual([entry('a'), entry('b')]);
+
+    // `b` cannot join and goes back to wait; `a` is still on its way.
+    await q.settle(scope, 'd1', ['b']);
+    await expect(q.delivering(scope)).resolves.toEqual([entry('a')]);
+    expect(await ids()).toEqual(['b']);
+
+    // `a` delivered.
+    await q.settle(scope, 'd1');
+    await expect(q.delivering(scope)).resolves.toEqual([]);
   });
 
   it('reads a drained batch back when its response was lost', async () => {

@@ -56,8 +56,20 @@ const AppendSchema = z.object({
     .string()
     .regex(/^[\w-]{1,64}$/, 'Use letters, digits, `_` or `-` (at most 64)')
     .optional(),
+  /**
+   * The composer state the follow-up was sent from, stored opaquely so a
+   * reloaded client can show and resend it as typed. Dropped above the cap.
+   */
+  composer: z.object({ editorData: z.record(z.string(), z.unknown()).optional() }).optional(),
   request: QueuedRequestSchema,
 });
+
+/** Composer state kept with an entry; larger editor documents are not stored. */
+const MAX_COMPOSER_BYTES = 32 * 1024;
+const storedComposer = (composer: z.infer<typeof AppendSchema>['composer']) =>
+  composer?.editorData && JSON.stringify(composer.editorData).length <= MAX_COMPOSER_BYTES
+    ? { editorData: composer.editorData }
+    : undefined;
 
 const steerQueueProcedure = wsCompatProcedure.use(serverDatabase);
 const steerQueueWriteProcedure = steerQueueProcedure.use(withScopedPermission('message:create'));
@@ -117,6 +129,7 @@ export const agentSteerQueueRouter = router({
 
     const entry: QueuedFollowUp = {
       audit: { clientIp: ctx.clientIp ?? undefined, userAgent: ctx.userAgent ?? undefined },
+      composer: storedComposer(input.composer),
       createdAt: Date.now(),
       id: input.id ?? randomUUID(),
       request: {
@@ -168,7 +181,11 @@ export const agentSteerQueueRouter = router({
     return { id: entry.id, length, queued: true as const };
   }),
 
-  /** The follow-ups waiting on a conversation, oldest first. */
+  /**
+   * The follow-ups on a conversation that are not delivered yet, oldest first.
+   * `delivering` ones were taken by a run that has not confirmed them: they
+   * cannot be withdrawn, and come back as waiting should the delivery fail.
+   */
   list: steerQueueProcedure.input(ScopeSchema).query(async ({ input, ctx }) => {
     await assertCanUseAgentRunConversation({
       db: ctx.serverDB,
@@ -177,14 +194,31 @@ export const agentSteerQueueRouter = router({
       workspaceId: ctx.workspaceId,
     });
 
-    const entries = await redisService.steerQueue.list<QueuedFollowUp>(toScope(input, ctx.userId));
-    return entries
-      .filter((entry) => entry.userId === ctx.userId)
-      .map(({ createdAt, id, request }) => ({
-        createdAt,
-        fileIds: request.fileIds,
-        id,
-        prompt: request.prompt,
+    const scope = toScope(input, ctx.userId);
+    const [waiting, delivering] = await Promise.all([
+      redisService.steerQueue.list<QueuedFollowUp>(scope),
+      redisService.steerQueue.delivering<QueuedFollowUp>(scope),
+    ]);
+    const own = (entry: QueuedFollowUp) => entry.userId === ctx.userId;
+    const waitingIds = new Set(waiting.map((entry) => entry.id));
+    return [
+      ...waiting.filter(own).map((entry) => ({ entry, delivering: false })),
+      // An entry returned to the queue mid-read is listed once, as waiting.
+      ...delivering
+        .filter((entry) => own(entry) && !waitingIds.has(entry.id))
+        .map((entry) => ({ entry, delivering: true })),
+    ]
+      .sort((a, b) => a.entry.createdAt - b.entry.createdAt)
+      .map(({ entry, delivering: isDelivering }) => ({
+        createdAt: entry.createdAt,
+        delivering: isDelivering,
+        editorData: entry.composer?.editorData,
+        fileIds: entry.request.fileIds,
+        id: entry.id,
+        mentionedAgents: entry.request.mentionedAgents,
+        prompt: entry.request.prompt,
+        selectedSkillIds: entry.request.selectedSkillIds,
+        selectedToolIds: entry.request.selectedToolIds,
       }));
   }),
 

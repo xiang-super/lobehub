@@ -13,14 +13,13 @@ import {
   type QueuedFile,
   type QueuedMessage,
   reconstructUploadFilesFromQueue,
-  SEND_NOW_CANCEL_REASON,
 } from '@/store/chat/slices/operation/types';
 import { messageMapKey } from '@/store/chat/utils/messageMapKey';
 import { useFileStore } from '@/store/file';
 
 import { useConversationResourceAccess } from '../hooks/useConversationResourceAccess';
 import { useConversationStore } from '../store';
-import { createQueueSendNowGate } from './utils';
+import { createQueueSendNowGate, sendQueuedMessageNow } from './utils';
 
 const PREVIEW_SIZE = 28;
 
@@ -247,42 +246,18 @@ const QueueTray = memo(() => {
   const handleSendNow = useCallback(
     async (msg: QueuedMessage) => {
       await sendNowGate
-        .run(async () => {
-          const chat = useChatStore.getState();
-          // Cancel EVERY running blocker the item could be queued behind, not just the
-          // first: matching one op would miss an interim blocker or the second of the
-          // two concurrent `regenerate` ops a delAndRegenerate/delAndResendThread
-          // retry runs (outer wrapper + inner regenerateUserMessage). Leaving any
-          // blocker running would make the sendMessage below re-enqueue the item, so
-          // "Send now" becomes a no-op. The selector shares the queue-blocking
-          // predicate with the enqueue check.
-          const runningOpIds =
-            operationSelectors.getRunningQueueBlockingOperationIds(context)(chat);
-          const cancellationConfirmed = await Promise.all(
-            runningOpIds.map((id) => chat.cancelOperation(id, SEND_NOW_CANCEL_REASON)),
-          );
-          if (cancellationConfirmed.some((confirmed) => !confirmed)) {
-            throw new Error('Running agent cancellation was not confirmed');
-          }
-          if (!(await withdraw(msg))) return;
-          // Reconstruct UploadFileItem-shaped objects so the optimistic temp message
-          // can rebuild imageList/videoList from the snapshotted preview metadata.
-          const filesArray = msg.filesPreview?.length
-            ? reconstructUploadFilesFromQueue(msg.filesPreview)
-            : msg.files?.length
-              ? (msg.files.map((id) => ({ id })) as any)
-              : undefined;
-          await chat.sendMessage({
+        .run(() =>
+          sendQueuedMessageNow({
+            chat: useChatStore.getState(),
             context,
-            editorData: msg.editorData,
-            files: filesArray,
-            message: msg.content,
-            metadata: { ...msg.metadata, steer: true },
-          });
-        })
+            contextKey,
+            msg,
+            withdraw,
+          }),
+        )
         .catch((error) => console.error('[QueueTray] sendNow failed:', error));
     },
-    [context, sendNowGate, withdraw],
+    [context, contextKey, sendNowGate, withdraw],
   );
 
   if (queuedMessages.length === 0) return null;

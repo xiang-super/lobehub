@@ -32,11 +32,15 @@ const queued = (id: string, patch: Partial<QueuedMessage> = {}): QueuedMessage =
   ...patch,
 });
 const queue = () => get().queuedMessages[key] ?? [];
+/** One entry of `agentSteerQueue.list`. */
+const pending = (id: string, patch: Record<string, unknown> = {}) =>
+  ({ createdAt: 1, delivering: false, fileIds: undefined, id, prompt: id, ...patch }) as any;
 
 beforeEach(() => {
   vi.useFakeTimers();
   useChatStore.setState(useChatStore.getInitialState());
   vi.spyOn(aiAgentService, 'setQueuedMessages').mockResolvedValue(undefined as never);
+  vi.spyOn(aiAgentService, 'listQueuedFollowUps').mockResolvedValue([]);
 });
 
 afterEach(async () => {
@@ -175,7 +179,7 @@ describe('server queue watch', () => {
     });
     const list = vi
       .spyOn(aiAgentService, 'listQueuedFollowUps')
-      .mockResolvedValueOnce([{ createdAt: 1, fileIds: undefined, id: 'q1', prompt: 'q1' }])
+      .mockResolvedValueOnce([pending('q1', { createdAt: 1, prompt: 'q1' })])
       .mockResolvedValue([]);
     get().enqueueMessage(key, queued('q1', { serverDelivery: 'appending' }));
 
@@ -186,6 +190,64 @@ describe('server queue watch', () => {
     await vi.advanceTimersByTimeAsync(SERVER_QUEUE_POLL_MS);
     expect(list).toHaveBeenCalledWith({ threadId: null, topicId: 'tpc-1' });
     expect(queue()).toHaveLength(0);
+  });
+});
+
+describe('server queue watch while a run delivers', () => {
+  // ROOT CAUSE:
+  //
+  // A drained follow-up left the waiting list before its run confirmed it, and
+  // the watch dropped it from the tray then. A failed delivery returns it to
+  // the queue, where it waited unseen until another run or a reload.
+  //
+  // Before: absence from the waiting list counted as delivered.
+  // After: one listed as `delivering` stays until it is gone from both.
+  it('keeps a follow-up the run took but has not confirmed, and one it gave back', async () => {
+    startRun();
+    vi.spyOn(aiAgentService, 'appendQueuedFollowUp').mockResolvedValue({
+      id: 'q1',
+      length: 1,
+      queued: true,
+    });
+    const list = vi
+      .spyOn(aiAgentService, 'listQueuedFollowUps')
+      .mockResolvedValueOnce([pending('q1', { delivering: true })])
+      .mockResolvedValueOnce([pending('q1')])
+      .mockResolvedValue([]);
+    get().enqueueMessage(key, queued('q1', { serverDelivery: 'appending' }));
+
+    await handOffQueuedMessage(get, key, context, 'q1', async () => request);
+    await vi.advanceTimersByTimeAsync(SERVER_QUEUE_POLL_MS);
+    expect(queue()).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(SERVER_QUEUE_POLL_MS);
+    expect(queue()).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(SERVER_QUEUE_POLL_MS);
+    expect(list).toHaveBeenCalledTimes(3);
+    expect(queue()).toHaveLength(0);
+  });
+
+  it('keeps showing one it could not withdraw because a run is delivering it', async () => {
+    get().enqueueMessage(key, queued('q1', { serverDelivery: 'server', serverRequest: request }));
+    vi.spyOn(aiAgentService, 'removeQueuedFollowUp').mockResolvedValue({ removed: false });
+    vi.spyOn(aiAgentService, 'listQueuedFollowUps').mockResolvedValue([
+      pending('q1', { delivering: true }),
+    ]);
+
+    await expect(withdrawQueuedMessage(get, key, 'q1')).resolves.toBe(false);
+    expect(queue()).toEqual([expect.objectContaining({ id: 'q1', serverDelivery: 'server' })]);
+  });
+
+  it('stores the composer state with the follow-up, so a reload can resend it as typed', async () => {
+    startRun();
+    const editorData = { root: { type: 'root' } };
+    const append = vi
+      .spyOn(aiAgentService, 'appendQueuedFollowUp')
+      .mockResolvedValue({ id: 'q1', length: 1, queued: true });
+    get().enqueueMessage(key, queued('q1', { editorData, serverDelivery: 'appending' }));
+
+    await handOffQueuedMessage(get, key, context, 'q1', async () => request);
+
+    expect(append).toHaveBeenCalledWith({ editorData, id: 'q1', request });
   });
 });
 
@@ -206,7 +268,7 @@ describe('server queue watch after the run ended without taking them', () => {
     });
     const list = vi
       .spyOn(aiAgentService, 'listQueuedFollowUps')
-      .mockResolvedValue([{ createdAt: 1, fileIds: undefined, id: 'q1', prompt: 'q1' }]);
+      .mockResolvedValue([pending('q1', { createdAt: 1, prompt: 'q1' })]);
     const remove = vi
       .spyOn(aiAgentService, 'removeQueuedFollowUp')
       .mockResolvedValue({ removed: true });
@@ -231,7 +293,7 @@ describe('server queue watch after the run ended without taking them', () => {
       queued: true,
     });
     vi.spyOn(aiAgentService, 'listQueuedFollowUps').mockResolvedValue([
-      { createdAt: 1, fileIds: undefined, id: 'q1', prompt: 'q1' },
+      pending('q1', { createdAt: 1, prompt: 'q1' }),
     ]);
     const remove = vi
       .spyOn(aiAgentService, 'removeQueuedFollowUp')
@@ -256,7 +318,7 @@ describe('server queue watch after the run ended without taking them', () => {
       queued: true,
     });
     vi.spyOn(aiAgentService, 'listQueuedFollowUps').mockResolvedValue([
-      { createdAt: 1, fileIds: undefined, id: 'q1', prompt: 'q1' },
+      pending('q1', { createdAt: 1, prompt: 'q1' }),
     ]);
     const remove = vi.spyOn(aiAgentService, 'removeQueuedFollowUp');
     get().enqueueMessage(key, queued('q1', { serverDelivery: 'appending' }));
@@ -281,7 +343,7 @@ describe('restoreServerQueuedMessages', () => {
   // After: they are back in the tray as the server's, and watched again.
   it('puts the follow-ups waiting on the server back in the tray and watches them', async () => {
     vi.spyOn(aiAgentService, 'listQueuedFollowUps')
-      .mockResolvedValueOnce([{ createdAt: 5, fileIds: undefined, id: 'q1', prompt: 'later' }])
+      .mockResolvedValueOnce([pending('q1', { createdAt: 5, prompt: 'later' })])
       .mockResolvedValue([]);
     startRun();
 
@@ -297,10 +359,37 @@ describe('restoreServerQueuedMessages', () => {
     expect(queue()).toHaveLength(0);
   });
 
+  it('brings back the composer state and selections it was sent with', async () => {
+    const editorData = { root: { type: 'root' } };
+    vi.spyOn(aiAgentService, 'listQueuedFollowUps')
+      .mockResolvedValueOnce([
+        pending('q1', {
+          editorData,
+          mentionedAgents: [{ id: 'agt-2', name: 'B' }],
+          selectedSkillIds: ['s1'],
+          selectedToolIds: ['t1'],
+        }),
+      ])
+      .mockResolvedValue([]);
+    startRun();
+
+    await restoreServerQueuedMessages(get, context);
+
+    // A local resend (after a stop, or Send now) re-reads these from `editorData`.
+    expect(queue()[0]).toMatchObject({
+      editorData,
+      serverRequest: {
+        mentionedAgents: [{ id: 'agt-2', name: 'B' }],
+        selectedSkillIds: ['s1'],
+        selectedToolIds: ['t1'],
+      },
+    });
+  });
+
   it('adds nothing twice and stays out of threads', async () => {
     const list = vi
       .spyOn(aiAgentService, 'listQueuedFollowUps')
-      .mockResolvedValue([{ createdAt: 5, fileIds: undefined, id: 'q1', prompt: 'later' }]);
+      .mockResolvedValue([pending('q1', { createdAt: 5, prompt: 'later' })]);
     get().enqueueMessage(key, queued('q1', { serverDelivery: 'server', serverRequest: request }));
 
     await restoreServerQueuedMessages(get, context);

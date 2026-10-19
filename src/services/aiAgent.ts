@@ -337,11 +337,17 @@ class AiAgentService {
    * tell whether the follow-up can join it. `queued: false` means nothing was
    * stored and this client must send it itself.
    */
-  async appendQueuedFollowUp(params: { id: string; request: QueuedFollowUpRequest }) {
+  async appendQueuedFollowUp(params: {
+    /** Composer state to keep with it, so a reloaded page can resend it as typed. */
+    editorData?: Record<string, any>;
+    id: string;
+    request: QueuedFollowUpRequest;
+  }) {
     const clientProtocol = canUseGatewayProtocolV2() ? CLIENT_PROTOCOL_VERSION : undefined;
     const llmExecutor = buildLlmExecutorDeclaration();
 
     return await lambdaClient.agentSteerQueue.append.mutate({
+      ...(params.editorData && { composer: { editorData: params.editorData } }),
       id: params.id,
       request: {
         clientProtocol,

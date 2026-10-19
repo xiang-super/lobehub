@@ -1,11 +1,14 @@
 import type { UIChatMessage } from '@lobechat/types';
 import { describe, expect, it, vi } from 'vitest';
 
+import { messageMapKey } from '@/store/chat/utils/messageMapKey';
+
 import {
   createQueueSendNowGate,
   getContextWindowMessages,
   getConversationChatInputUiState,
   getConversationSendButtonProps,
+  sendQueuedMessageNow,
   toChatInputMessages,
   toDisplayableSendErrorMessage,
 } from './utils';
@@ -272,5 +275,109 @@ describe('toDisplayableSendErrorMessage', () => {
     expect(toDisplayableSendErrorMessage('  Network error  ')).toBe('Network error');
     expect(toDisplayableSendErrorMessage('   ')).toBeUndefined();
     expect(toDisplayableSendErrorMessage()).toBeUndefined();
+  });
+});
+
+describe('sendQueuedMessageNow', () => {
+  const context = { agentId: 'agt-1', topicId: 'tpc-1' };
+  const msg = {
+    content: 'now',
+    createdAt: 1,
+    id: 'q1',
+    interruptMode: 'soft' as const,
+    serverDelivery: 'server' as const,
+  };
+  const chatWith = (cancelled: boolean | Error) => {
+    const order: string[] = [];
+    const chat = {
+      cancelOperation: vi.fn(async () => {
+        order.push('cancel');
+        if (cancelled instanceof Error) throw cancelled;
+        return cancelled;
+      }),
+      enqueueMessage: vi.fn(),
+      operations: {
+        'op-1': {
+          context,
+          id: 'op-1',
+          metadata: { startTime: 1 },
+          status: 'running',
+          type: 'execServerAgentRuntime',
+        },
+      },
+      operationsByContext: { [messageMapKey(context)]: ['op-1'] },
+      queuedMessages: { [messageMapKey(context)]: [msg] },
+      sendMessage: vi.fn(async () => {
+        order.push('send');
+      }),
+    } as any;
+    return { chat, order };
+  };
+
+  // ROOT CAUSE:
+  //
+  // Send now interrupted the run before withdrawing the item. When that run
+  // had already taken it from the server, the withdrawal then failed and no
+  // replacement send happened, leaving the follow-up unanswered.
+  //
+  // Before: cancel, then withdraw.
+  // After: withdraw first; an item already on its way stops nothing.
+  it('withdraws the item before interrupting the run, then sends it', async () => {
+    const { chat, order } = chatWith(true);
+    const withdraw = vi.fn(async () => {
+      order.push('withdraw');
+      return true;
+    });
+
+    await sendQueuedMessageNow({
+      chat,
+      context,
+      contextKey: messageMapKey(context),
+      msg,
+      withdraw,
+    });
+
+    expect(order).toEqual(['withdraw', 'cancel', 'send']);
+    expect(chat.sendMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ message: 'now', metadata: { steer: true } }),
+    );
+  });
+
+  it('stops nothing and sends nothing when the run already took it', async () => {
+    const { chat } = chatWith(true);
+
+    await sendQueuedMessageNow({
+      chat,
+      context,
+      contextKey: messageMapKey(context),
+      msg,
+      withdraw: async () => false,
+    });
+
+    expect(chat.cancelOperation).not.toHaveBeenCalled();
+    expect(chat.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['unconfirmed', false],
+    ['failed', new Error('device unreachable')],
+  ])('puts the item back, held here, when the interrupt is %s', async (_label, cancelled) => {
+    const { chat } = chatWith(cancelled);
+
+    await expect(
+      sendQueuedMessageNow({
+        chat,
+        context,
+        contextKey: messageMapKey(context),
+        msg,
+        withdraw: async () => true,
+      }),
+    ).rejects.toThrow();
+
+    expect(chat.enqueueMessage).toHaveBeenCalledWith(messageMapKey(context), {
+      ...msg,
+      serverDelivery: undefined,
+    });
+    expect(chat.sendMessage).not.toHaveBeenCalled();
   });
 });

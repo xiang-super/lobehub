@@ -7,6 +7,7 @@ import { agentSteerQueueRouter } from '../agentSteerQueue';
 
 const mocks = vi.hoisted(() => ({
   append: vi.fn(),
+  delivering: vi.fn(),
   isRunningOperationAlive: vi.fn(),
   list: vi.fn(),
   liveCandidates: vi.fn(),
@@ -20,7 +21,12 @@ vi.mock('@/database/models/topic', () => ({
 }));
 vi.mock('@/server/services/redis', () => ({
   redisService: {
-    steerQueue: { append: mocks.append, list: mocks.list, remove: mocks.remove },
+    steerQueue: {
+      append: mocks.append,
+      delivering: mocks.delivering,
+      list: mocks.list,
+      remove: mocks.remove,
+    },
   },
 }));
 vi.mock('@/server/routers/lambda/_helpers/workspaceAgentGuard', () => ({
@@ -100,6 +106,16 @@ describe('agentSteerQueueRouter.append', () => {
     });
     expect(entry.request.appContext.projectWorkingDirectoryId).toBeUndefined();
     expect(entry.request.streamFeatures).toBeUndefined();
+  });
+
+  it('keeps the composer state it was sent from, up to a cap', async () => {
+    const editorData = { root: { children: [], type: 'root' } };
+    await caller().append({ ...appendInput, composer: { editorData } });
+    expect(mocks.append.mock.calls[0][1].composer).toEqual({ editorData });
+
+    const huge = { root: { text: 'x'.repeat(40 * 1024) } };
+    await caller().append({ ...appendInput, composer: { editorData: huge } });
+    expect(mocks.append.mock.calls[1][1].composer).toBeUndefined();
   });
 
   it('tells the client to send directly when no run is live', async () => {
@@ -188,12 +204,48 @@ describe('agentSteerQueueRouter.list / remove', () => {
       { createdAt: 1, id: 'mine', request: { prompt: 'a' }, userId: 'user-1' },
       { createdAt: 2, id: 'theirs', request: { prompt: 'b' }, userId: 'user-2' },
     ]);
+    mocks.delivering.mockResolvedValue([]);
     mocks.remove.mockResolvedValue(true);
   });
 
   it('lists only the caller’s own follow-ups', async () => {
     await expect(caller().list({ topicId: 'tpc-1' })).resolves.toEqual([
-      { createdAt: 1, fileIds: undefined, id: 'mine', prompt: 'a' },
+      expect.objectContaining({ createdAt: 1, delivering: false, id: 'mine', prompt: 'a' }),
+    ]);
+  });
+
+  // ROOT CAUSE:
+  //
+  // A drained entry left the waiting list before its run confirmed it, so a
+  // client treated it as delivered and dropped it, though a failed delivery
+  // returns it to the queue — invisible until another run or a reload.
+  //
+  // Before: only waiting entries were listed.
+  // After: taken-but-unconfirmed ones are listed as `delivering`, in order,
+  // with what a reloaded client needs to resend them as typed.
+  it('lists follow-ups a run took but has not confirmed as delivering', async () => {
+    const editorData = { root: { type: 'root' } };
+    mocks.delivering.mockResolvedValue([
+      {
+        composer: { editorData },
+        createdAt: 0,
+        id: 'taken',
+        request: { prompt: 'z', selectedSkillIds: ['s1'] },
+        userId: 'user-1',
+      },
+      { createdAt: 3, id: 'other', request: { prompt: 'y' }, userId: 'user-2' },
+      // Returned to the queue between the two reads: listed once, as waiting.
+      { createdAt: 1, id: 'mine', request: { prompt: 'a' }, userId: 'user-1' },
+    ]);
+
+    await expect(caller().list({ topicId: 'tpc-1' })).resolves.toEqual([
+      expect.objectContaining({
+        delivering: true,
+        editorData,
+        id: 'taken',
+        selectedSkillIds: ['s1'],
+      }),
+      expect.objectContaining({ delivering: false, id: 'mine' }),
     ]);
   });
 

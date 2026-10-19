@@ -82,11 +82,15 @@ const sendIfIdle = (get: Get, contextKey: string, context: ConversationContext) 
   scheduleQueuedFollowUp(get, context, operationIds.at(-1) ?? '');
 };
 
-const appendWithRetry = async (id: string, request: QueuedFollowUpRequest) => {
+const appendWithRetry = async (
+  id: string,
+  request: QueuedFollowUpRequest,
+  editorData?: Record<string, any>,
+) => {
   let lastError: unknown;
   for (let attempt = 0; attempt < APPEND_ATTEMPTS; attempt++) {
     try {
-      return await aiAgentService.appendQueuedFollowUp({ id, request });
+      return await aiAgentService.appendQueuedFollowUp({ editorData, id, request });
     } catch (error) {
       lastError = error;
       if (!isTrpcErrorCode(error, 'SERVICE_UNAVAILABLE')) break;
@@ -135,7 +139,8 @@ export const handOffQueuedMessage = (
     get().updateQueuedMessage(contextKey, id, { serverDelivery: 'appending' });
     let queued = false;
     try {
-      queued = (await appendWithRetry(id, request)).queued;
+      queued = (await appendWithRetry(id, request, findQueued(get, contextKey, id)?.editorData))
+        .queued;
     } catch (error) {
       // Unknown whether it was stored. Keeping it here can at worst send it
       // twice; dropping it could lose it.
@@ -240,12 +245,14 @@ export const watchServerQueue = (get: Get, contextKey: string, context: Conversa
     }
 
     try {
-      const waiting = new Set(
+      // Taken by a run but not confirmed (`delivering`) still counts as held:
+      // a failed delivery returns it to the queue.
+      const notDelivered = new Set(
         (await aiAgentService.listQueuedFollowUps(surfaceOf(held[0].serverRequest!))).map(
           (entry) => entry.id,
         ),
       );
-      const delivered = held.filter((message) => !waiting.has(message.id));
+      const delivered = held.filter((message) => !notDelivered.has(message.id));
       for (const message of delivered) {
         if (findQueued(get, contextKey, message.id)?.serverDelivery === 'server')
           get().removeQueuedMessage(contextKey, message.id);
@@ -267,9 +274,12 @@ export const watchServerQueue = (get: Get, contextKey: string, context: Conversa
     const stopped =
       operationSelectors.getIdleQueueHost(context)(get())?.metadata.endedWithoutCompletion;
     if (stopped || ticksWithoutRun >= ORPHANED_QUEUE_TICKS) {
-      watchers.delete(contextKey);
       await reclaimServerQueuedMessages(get, contextKey);
-      return;
+      // One still on its way stays the server's until it lands or comes back.
+      if (!queueOf(get, contextKey).some((message) => message.serverDelivery === 'server')) {
+        watchers.delete(contextKey);
+        return;
+      }
     }
 
     setTimeout(tick, SERVER_QUEUE_POLL_MS);
@@ -293,19 +303,22 @@ export const restoreServerQueuedMessages = async (
   if (context.threadId || context.agentShareId || context.topicShareId) return;
 
   const surface = { threadId: null, topicId };
-  const waiting = await aiAgentService.listQueuedFollowUps(surface).catch((error) => {
+  const pending = await aiAgentService.listQueuedFollowUps(surface).catch((error) => {
     console.error('[serverSteerQueue] reading the server queue failed:', error);
     return [];
   });
-  if (waiting.length === 0) return;
+  if (pending.length === 0) return;
 
   const contextKey = messageMapKey(context);
   const known = new Set(queueOf(get, contextKey).map((message) => message.id));
-  for (const entry of waiting) {
+  for (const entry of pending) {
     if (known.has(entry.id)) continue;
     get().enqueueMessage(contextKey, {
       content: entry.prompt,
       createdAt: entry.createdAt,
+      // The composer state it was sent from, so a local resend keeps its
+      // selected skills, tools and mentions.
+      ...(entry.editorData && { editorData: entry.editorData }),
       ...(entry.fileIds?.length && { files: entry.fileIds }),
       id: entry.id,
       interruptMode: 'soft',
@@ -314,12 +327,21 @@ export const restoreServerQueuedMessages = async (
         agentId,
         appContext: { threadId: null, topicId },
         fileIds: entry.fileIds ?? undefined,
+        mentionedAgents: entry.mentionedAgents ?? undefined,
         prompt: entry.prompt,
+        selectedSkillIds: entry.selectedSkillIds ?? undefined,
+        selectedToolIds: entry.selectedToolIds ?? undefined,
       },
     });
   }
-  log('[%s] restored %d follow-ups from the server', contextKey, waiting.length);
+  log('[%s] restored %d follow-ups from the server', contextKey, pending.length);
   watchServerQueue(get, contextKey, context);
+};
+
+/** Whether a run took the follow-up and has not confirmed its delivery yet. */
+const isDelivering = async (request: QueuedFollowUpRequest, id: string): Promise<boolean> => {
+  const pending = await aiAgentService.listQueuedFollowUps(surfaceOf(request)).catch(() => []);
+  return pending.some((entry) => entry.id === id && entry.delivering);
 };
 
 /**
@@ -343,7 +365,8 @@ export const reclaimServerQueuedMessages = (get: Get, contextKey: string): Promi
         });
         if (removed)
           get().updateQueuedMessage(contextKey, message.id, { serverDelivery: undefined });
-        else get().removeQueuedMessage(contextKey, message.id);
+        else if (!(await isDelivering(message.serverRequest, message.id)))
+          get().removeQueuedMessage(contextKey, message.id);
       } catch (error) {
         // Still on the server, which delivers it on the conversation's next run.
         console.error('[serverSteerQueue] taking a follow-up back failed:', error);
@@ -374,7 +397,9 @@ export const withdrawQueuedMessage = async (
       ...surfaceOf(message.serverRequest),
       id,
     });
-    get().removeQueuedMessage(contextKey, id);
+    // Taken but not confirmed: it stays shown until it lands or comes back.
+    if (removed || !(await isDelivering(message.serverRequest, id)))
+      get().removeQueuedMessage(contextKey, id);
     return removed;
   }
 
