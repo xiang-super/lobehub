@@ -9,6 +9,25 @@ import {
 import type { ChatStore } from '@/store/chat/store';
 import { messageMapKey } from '@/store/chat/utils/messageMapKey';
 
+/**
+ * The conversation key whose queue nothing will drain, so a new send must
+ * take it along instead of overtaking it: behind a Stop, or — on an existing
+ * topic — left by a failed run or restored from the server.
+ */
+export const findOrphanedQueueKey = (
+  get: () => ChatStore,
+  keys: string[],
+  willCreateNewTopic: boolean,
+): string | undefined =>
+  keys.find((key) => {
+    if ((get().queuedMessages[key]?.length ?? 0) === 0) return false;
+    if (!willCreateNewTopic) return true;
+    return (get().operationsByContext[key] || []).some((id) => {
+      const operation = get().operations[id];
+      return operation?.status === 'cancelled' && operation.metadata.isAborting;
+    });
+  });
+
 /** Send drained queued messages as one steered turn. */
 export const sendQueuedMessages = (
   get: () => ChatStore,

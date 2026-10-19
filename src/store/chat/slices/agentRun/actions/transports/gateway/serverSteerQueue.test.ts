@@ -302,6 +302,32 @@ describe('server queue watch while a run delivers', () => {
     expect(queue()).toEqual([expect.objectContaining({ id: 'q1', serverDelivery: 'server' })]);
   });
 
+  it('backs off while the queue cannot be read, and resumes the normal pace once it can', async () => {
+    startRun();
+    vi.spyOn(aiAgentService, 'appendQueuedFollowUp').mockResolvedValue({
+      id: 'q1',
+      length: 1,
+      queued: true,
+    });
+    const list = vi
+      .spyOn(aiAgentService, 'listQueuedFollowUps')
+      .mockRejectedValueOnce(new Error('down'))
+      .mockRejectedValueOnce(new Error('down'))
+      .mockResolvedValue([pending('q1')]);
+    get().enqueueMessage(key, queued('q1', { serverDelivery: 'appending' }));
+    await handOffQueuedMessage(get, key, context, 'q1', async () => request);
+
+    await vi.advanceTimersByTimeAsync(SERVER_QUEUE_POLL_MS); // 1st read fails
+    await vi.advanceTimersByTimeAsync(SERVER_QUEUE_POLL_MS * 2 - 1);
+    expect(list).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1); // 2nd read after 3s, fails
+    expect(list).toHaveBeenCalledTimes(2);
+    await vi.advanceTimersByTimeAsync(SERVER_QUEUE_POLL_MS * 4); // 3rd after 6s, succeeds
+    expect(list).toHaveBeenCalledTimes(3);
+    await vi.advanceTimersByTimeAsync(SERVER_QUEUE_POLL_MS); // back to 1.5s
+    expect(list).toHaveBeenCalledTimes(4);
+  });
+
   it('keeps the row and reports the failure when a withdrawal cannot reach the queue', async () => {
     get().enqueueMessage(key, queued('q1', { serverDelivery: 'server', serverRequest: request }));
     vi.spyOn(aiAgentService, 'removeQueuedFollowUp').mockRejectedValue(
@@ -488,6 +514,19 @@ describe('restoreServerQueuedMessages', () => {
     await restoreServerQueuedMessages(get, context);
 
     expect(queue()[0]).toMatchObject({ files: ['f1'], filesPreview, serverDelivery: 'server' });
+  });
+
+  it('retries reading the queue when the conversation opens during an outage', async () => {
+    vi.spyOn(aiAgentService, 'listQueuedFollowUps')
+      .mockRejectedValueOnce(new Error('down'))
+      .mockResolvedValueOnce([pending('q1', { prompt: 'later' })])
+      .mockResolvedValue([]);
+
+    const restoring = restoreServerQueuedMessages(get, context);
+    await vi.advanceTimersByTimeAsync(SERVER_QUEUE_POLL_MS);
+    await restoring;
+
+    expect(queue()).toEqual([expect.objectContaining({ content: 'later', id: 'q1' })]);
   });
 
   it('adds nothing twice and stays out of threads', async () => {

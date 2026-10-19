@@ -78,7 +78,10 @@ import { selectRuntimeType } from '@/store/chat/slices/agentRun/actions/dispatch
 import { executeDirectMention } from '@/store/chat/slices/agentRun/actions/dispatch/directMentionExecutor';
 import { resolveNewThreadIntent } from '@/store/chat/slices/agentRun/actions/dispatch/newThreadIntent';
 import { buildRunLifecycle } from '@/store/chat/slices/agentRun/actions/lifecycle/buildRunLifecycle';
-import { sendQueuedMessages } from '@/store/chat/slices/agentRun/actions/lifecycle/queuedFollowUp';
+import {
+  findOrphanedQueueKey,
+  sendQueuedMessages,
+} from '@/store/chat/slices/agentRun/actions/lifecycle/queuedFollowUp';
 import type { RunScope } from '@/store/chat/slices/agentRun/actions/lifecycle/types';
 import { buildQueuedFollowUpRequest } from '@/store/chat/slices/agentRun/actions/transports/gateway/execRequest';
 import {
@@ -90,7 +93,11 @@ import {
   getNativeHeteroSessionBindingKey,
   resolveHeteroResume,
 } from '@/store/chat/slices/agentRun/actions/transports/hetero/heteroResume';
-import { isQueueBlockingOperation, snapshotQueuedFiles } from '@/store/chat/slices/operation/types';
+import {
+  isClientHeldQueuedMessage,
+  isQueueBlockingOperation,
+  snapshotQueuedFiles,
+} from '@/store/chat/slices/operation/types';
 import { PortalViewType } from '@/store/chat/slices/portal/initialState';
 import { chatPortalSelectors } from '@/store/chat/slices/portal/selectors';
 import { resolveTopicHeteroPin } from '@/store/chat/slices/topic/selectors';
@@ -797,17 +804,18 @@ export class ConversationLifecycleActionImpl {
       !runningQueueBlockingOp &&
       !onlyAddUserMessage &&
       operationSelectors.isQueueDrainPending(operationContext)(this.#get());
-    if (runningQueueBlockingOp || queueDrainPending) {
+    /** Queue this send behind what holds `key`, on the server when it can join. */
+    const queueThisSend = (key: string) => {
       const queuedId = nanoid();
       // Behind a Gateway run the server keeps the follow-up, so the run can join it.
       const queueOnServer =
         !onlyAddUserMessage &&
-        canQueueOnServer(this.#get, queueTargetKey, {
+        canQueueOnServer(this.#get, key, {
           context: operationContext,
           isGatewayRun: runtimeType === 'gateway' && !directMentionRoute && !willCreateNewTopic,
         });
       this.#get().enqueueMessage(
-        queueTargetKey,
+        key,
         {
           id: queuedId,
           content: message,
@@ -823,7 +831,7 @@ export class ConversationLifecycleActionImpl {
         runningQueueBlockingOp?.id,
       );
       if (queueOnServer)
-        void handOffQueuedMessage(this.#get, queueTargetKey, operationContext, queuedId, () =>
+        void handOffQueuedMessage(this.#get, key, operationContext, queuedId, () =>
           buildQueuedFollowUpRequest(this.#get, {
             context: operationContext,
             fileIds: fileIdList,
@@ -835,23 +843,21 @@ export class ConversationLifecycleActionImpl {
           }),
         );
       notifyMessageAccepted();
-      return;
-    }
+    };
+    if (runningQueueBlockingOp || queueDrainPending) return void queueThisSend(queueTargetKey);
 
-    // A stopped run starts nothing next: take its follow-ups back from the server.
+    // Nothing runs: take server-queued follow-ups back; one still being delivered keeps its place.
     await Promise.all(queueCandidateKeys.map((key) => reclaimServerQueuedMessages(this.#get, key)));
+    const heldKey = queueCandidateKeys.find((key) =>
+      this.#get().queuedMessages[key]?.some((queued) => !isClientHeldQueuedMessage(queued)),
+    );
+    if (heldKey && !onlyAddUserMessage) return void queueThisSend(heldKey);
 
-    // Stop may already have moved the old operation to `cancelled`, so there is
-    // no live blocker left to drain follow-ups that were queued before Stop.
-    // Fold the new send into that FIFO and immediately restart the whole batch;
-    // otherwise the new message jumps ahead and the older queue drains after it.
-    const orphanedQueueKey = queueCandidateKeys.find((key) => {
-      if ((this.#get().queuedMessages[key]?.length ?? 0) === 0) return false;
-      return (this.#get().operationsByContext[key] || []).some((id) => {
-        const operation = this.#get().operations[id];
-        return operation?.status === 'cancelled' && operation.metadata.isAborting;
-      });
-    });
+    const orphanedQueueKey = findOrphanedQueueKey(
+      this.#get,
+      queueCandidateKeys,
+      willCreateNewTopic,
+    );
     if (orphanedQueueKey && !onlyAddUserMessage) {
       this.#get().enqueueMessage(orphanedQueueKey, {
         content: message,

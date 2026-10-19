@@ -109,4 +109,87 @@ describe('sendMessage behind a running Gateway run', () => {
       pending: true,
     });
   });
+
+  // ROOT CAUSE:
+  //
+  // Follow-ups restored behind an idle topic (or left by a failed run) were
+  // only sent after a newer message's turn finished: the newer send started
+  // at once and overtook them.
+  //
+  // Before: only a queue behind a Stop was folded into the new send.
+  // After: any queue nothing drains goes first, together with the new send.
+  it('sends follow-ups still queued here before a newer send, in one turn', async () => {
+    vi.useFakeTimers();
+    const sendQueued = vi.fn().mockResolvedValue(undefined);
+    act(() => {
+      useChatStore.setState({
+        operations: {},
+        operationsByContext: {},
+        queuedMessages: {
+          [contextKey]: [{ content: 'earlier', createdAt: 1, id: 'q0', interruptMode: 'soft' }],
+        },
+      });
+    });
+    const { result } = renderHook(() => useChatStore());
+    const original = result.current.sendMessage;
+
+    await act(async () => {
+      await original({ context, message: 'newer' });
+    });
+    useChatStore.setState({ sendMessage: sendQueued });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(10);
+    });
+    vi.useRealTimers();
+
+    expect(sendQueued).toHaveBeenCalledWith(
+      expect.objectContaining({ message: 'earlier\n\nnewer', metadata: { steer: true } }),
+    );
+  });
+
+  it('waits behind a follow-up a run is still delivering, instead of overtaking it', async () => {
+    vi.spyOn(aiAgentService, 'removeQueuedFollowUp').mockResolvedValue({
+      removed: false,
+      state: 'delivering',
+    });
+    vi.spyOn(aiAgentService, 'appendQueuedFollowUp').mockResolvedValue({
+      id: 'x',
+      length: 2,
+      queued: true,
+    });
+    const serverRequest = {
+      agentId: TEST_IDS.SESSION_ID,
+      appContext: { topicId: TEST_IDS.TOPIC_ID },
+      prompt: 'earlier',
+    };
+    act(() => {
+      useChatStore.setState({
+        operations: {},
+        operationsByContext: {},
+        queuedMessages: {
+          [contextKey]: [
+            {
+              content: 'earlier',
+              createdAt: 1,
+              id: 'q0',
+              interruptMode: 'soft',
+              serverDelivery: 'server',
+              serverRequest,
+            },
+          ],
+        },
+      });
+    });
+    const { result } = renderHook(() => useChatStore());
+
+    await act(async () => {
+      await result.current.sendMessage({ context, message: 'newer' });
+    });
+
+    expect(result.current.executeGatewayAgent).not.toHaveBeenCalled();
+    expect(useChatStore.getState().queuedMessages[contextKey].map((m) => m.content)).toEqual([
+      'earlier',
+      'newer',
+    ]);
+  });
 });

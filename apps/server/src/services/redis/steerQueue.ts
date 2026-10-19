@@ -104,7 +104,11 @@ local function joinBatch(expiry, items)
   return tostring(expiry) .. SEP .. table.concat(items, SEP)
 end
 local function pushFront(qkey, items)
+  if #items == 0 then return end
   for i = #items, 1, -1 do redis.call('LPUSH', qkey, unbind(items[i])) end
+  -- A drain that took the whole list deleted the queue key; the push recreated
+  -- it without a TTL, and an abandoned follow-up must still expire.
+  redis.call('EXPIRE', qkey, ${QUEUE_TTL_SECONDS})
 end
 local function reclaimLapsed(qkey, pkey, now)
   local all = redis.call('HGETALL', pkey)

@@ -20,6 +20,19 @@ const log = debug('lobe-store:server-steer-queue');
 
 /** How often a conversation with follow-ups on the server checks which are still waiting. */
 export const SERVER_QUEUE_POLL_MS = 1500;
+/** Longest wait between checks while the queue cannot be read. */
+const MAX_POLL_BACKOFF_MS = 30_000;
+/** A hidden tab checks this rarely; nothing on screen needs the tray then. */
+const HIDDEN_POLL_MS = 15_000;
+/** Reads of the queue when a conversation opens, should the first ones fail. */
+const RESTORE_ATTEMPTS = 5;
+
+/** Delay before the next check: backs off after failed reads, and while hidden. */
+const nextPollDelay = (failures: number) => {
+  const delay = Math.min(SERVER_QUEUE_POLL_MS * 2 ** failures, MAX_POLL_BACKOFF_MS);
+  const hidden = typeof document !== 'undefined' && document.visibilityState === 'hidden';
+  return hidden ? Math.max(delay, HIDDEN_POLL_MS) : delay;
+};
 /** Reads of the topic after the server took the follow-ups, until its next run shows up. */
 const SUCCESSOR_SYNC_ATTEMPTS = 5;
 /** How long to wait for the run that took the follow-ups to end here. */
@@ -286,6 +299,7 @@ export const watchServerQueue = (get: Get, contextKey: string, context: Conversa
   if (watchers.has(contextKey)) return;
   watchers.add(contextKey);
   let ticksWithoutRun = 0;
+  let failures = 0;
 
   const tick = async () => {
     const held = queueOf(get, contextKey).filter(
@@ -325,7 +339,10 @@ export const watchServerQueue = (get: Get, contextKey: string, context: Conversa
         await onServerQueueDelivered(get, contextKey, context);
         return;
       }
+      failures = 0;
     } catch (error) {
+      // Unknown, not delivered: keep them, and back off an already failing path.
+      failures += 1;
       console.error('[serverSteerQueue] reading the server queue failed:', error);
     }
 
@@ -342,10 +359,24 @@ export const watchServerQueue = (get: Get, contextKey: string, context: Conversa
       }
     }
 
-    setTimeout(tick, SERVER_QUEUE_POLL_MS);
+    setTimeout(tick, nextPollDelay(failures));
   };
 
-  setTimeout(tick, SERVER_QUEUE_POLL_MS);
+  setTimeout(tick, nextPollDelay(0));
+};
+
+/** Read the queue, retrying with backoff: a failed read is unknown, not empty. */
+const listWithRetry = async (surface: { threadId: null; topicId: string }) => {
+  for (let attempt = 0; attempt < RESTORE_ATTEMPTS; attempt++) {
+    try {
+      return await aiAgentService.listQueuedFollowUps(surface);
+    } catch (error) {
+      console.error('[serverSteerQueue] reading the server queue failed:', error);
+      if (attempt < RESTORE_ATTEMPTS - 1)
+        await new Promise((resolve) => setTimeout(resolve, nextPollDelay(attempt)));
+    }
+  }
+  return [];
 };
 
 /**
@@ -365,10 +396,7 @@ export const restoreServerQueuedMessages = async (
   if (!get().isGatewayModeEnabled?.(agentId)) return;
 
   const surface = { threadId: null, topicId };
-  const pending = await aiAgentService.listQueuedFollowUps(surface).catch((error) => {
-    console.error('[serverSteerQueue] reading the server queue failed:', error);
-    return [];
-  });
+  const pending = await listWithRetry(surface);
   if (pending.length === 0) return;
 
   const contextKey = messageMapKey(context);

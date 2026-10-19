@@ -28,10 +28,13 @@ const createFakeRedis = () => {
   const unbind = (item: string) => `${header(item).id}\t*${item.slice(item.indexOf('\n'))}`;
   const inFlight = (key: string) =>
     [...batchesOf(key).values()].reduce((n, batch) => n + batch.items.length, 0);
+  // Whether the scripts' `pushFront` renews the queue TTL, read off their source.
+  let pushFrontRenewsTtl = false;
   const reclaim = (qkey: string, pkey: string, now: number) => {
     for (const [id, batch] of batchesOf(pkey)) {
       if (batch.expiry <= now) {
         lists.set(qkey, [...batch.items.map(unbind), ...listOf(qkey)]);
+        if (pushFrontRenewsTtl) ttls.set(qkey, 24 * 60 * 60);
         batchesOf(pkey).delete(id);
       }
     }
@@ -40,6 +43,7 @@ const createFakeRedis = () => {
   const evalScript = vi.fn(async (script: string, numKeys: number, ...rest: any[]) => {
     const keys = rest.slice(0, numKeys);
     const args = rest.slice(numKeys);
+    pushFrontRenewsTtl = /local function pushFront[\s\S]*?'EXPIRE', qkey[\s\S]*?\nend/.test(script);
     const [key] = keys;
     const list = listOf(key);
 
@@ -216,6 +220,26 @@ describe('redisService.steerQueue', () => {
     await q.drain(scope, 'op-2', [], 'd2');
     vi.advanceTimersByTime(5 * 60 * 1000 + 1);
     await expect(q.entryState(scope, 'a', { remove: true })).resolves.toBe('removed');
+  });
+
+  // ROOT CAUSE:
+  //
+  // A drain that took the whole list deleted the queue key; returning a lapsed
+  // batch recreated it without a TTL, so an abandoned follow-up never expired
+  // and could replay into an unrelated run much later.
+  //
+  // Before: the reclaimed queue had no expiry.
+  // After: moving entries back renews the queue TTL.
+  it('keeps the queue expiring after a lapsed batch recreates it', async () => {
+    vi.useFakeTimers();
+    await q.append(scope, entry('a'), 'op-1');
+    await q.drain(scope, 'op-1', [], 'd1');
+    redis.ttls.clear();
+    vi.advanceTimersByTime(5 * 60 * 1000 + 1);
+
+    await q.snapshot(scope);
+
+    expect(redis.ttls.get('follow_ups:v1:u1:tpc-1:main')).toBe(24 * 60 * 60);
   });
 
   it('reports an outage instead of an empty queue', async () => {
