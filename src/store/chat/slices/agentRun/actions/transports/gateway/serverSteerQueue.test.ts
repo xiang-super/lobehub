@@ -39,6 +39,7 @@ const pending = (id: string, patch: Record<string, unknown> = {}) =>
 beforeEach(() => {
   vi.useFakeTimers();
   useChatStore.setState(useChatStore.getInitialState());
+  useChatStore.setState({ isGatewayModeEnabled: () => true });
   vi.spyOn(aiAgentService, 'setQueuedMessages').mockResolvedValue(undefined as never);
   vi.spyOn(aiAgentService, 'listQueuedFollowUps').mockResolvedValue([]);
 });
@@ -88,7 +89,7 @@ describe('handOffQueuedMessage', () => {
 
     await handOffQueuedMessage(get, key, context, 'q1', async () => request);
 
-    expect(append).toHaveBeenCalledWith({ id: 'q1', request });
+    expect(append).toHaveBeenCalledWith(expect.objectContaining({ id: 'q1', request }));
     expect(queue()[0]).toMatchObject({ serverDelivery: 'server', serverRequest: request });
     expect(aiAgentService.setQueuedMessages).not.toHaveBeenCalled();
     // The server delivers it; the client's own drain takes nothing.
@@ -148,6 +149,63 @@ describe('handOffQueuedMessage', () => {
     expect(queue()[0].serverDelivery).toBe('server');
   });
 
+  // ROOT CAUSE:
+  //
+  // An append that committed but whose answers all failed fell back to this
+  // client, which then sent it after the run while the server delivered its
+  // copy too — the follow-up (and any tool side effects) ran twice.
+  //
+  // Before: an unknown outcome kept it here.
+  // After: it stays the server's until the same id is appended again and the
+  // server says where it is.
+  it('keeps an append with an unknown outcome the server’s and settles it by its id', async () => {
+    const unavailable = Object.assign(new Error('unknown'), {
+      data: { code: 'SERVICE_UNAVAILABLE' },
+    });
+    const append = vi
+      .spyOn(aiAgentService, 'appendQueuedFollowUp')
+      .mockRejectedValueOnce(unavailable)
+      .mockRejectedValueOnce(unavailable)
+      .mockRejectedValueOnce(unavailable)
+      .mockResolvedValueOnce({ id: 'q1', length: 1, queued: true });
+    startRun();
+    get().enqueueMessage(key, queued('q1', { serverDelivery: 'appending' }));
+
+    await handOffQueuedMessage(get, key, context, 'q1', async () => request);
+
+    expect(queue()[0]).toMatchObject({ serverDelivery: 'server', serverUnconfirmed: true });
+    expect(get().drainQueuedMessages(key)).toEqual([]);
+
+    // Not listed: append the same id again; the server says it is waiting.
+    await vi.advanceTimersByTimeAsync(SERVER_QUEUE_POLL_MS);
+    expect(append).toHaveBeenCalledTimes(4);
+    expect(append.mock.calls[3][0].id).toBe('q1');
+    expect(queue()[0]).toMatchObject({ serverDelivery: 'server', serverUnconfirmed: undefined });
+  });
+
+  it('sends an unconfirmed follow-up here only once the server says it never held it', async () => {
+    const sendMessage = vi.fn().mockResolvedValue(undefined);
+    useChatStore.setState({ sendMessage });
+    const unavailable = Object.assign(new Error('unknown'), {
+      data: { code: 'SERVICE_UNAVAILABLE' },
+    });
+    vi.spyOn(aiAgentService, 'appendQueuedFollowUp')
+      .mockRejectedValueOnce(unavailable)
+      .mockRejectedValueOnce(unavailable)
+      .mockRejectedValueOnce(unavailable)
+      .mockResolvedValueOnce({ queued: false, reason: 'idle' });
+    get().enqueueMessage(key, queued('q1', { serverDelivery: 'appending' }));
+
+    await handOffQueuedMessage(get, key, context, 'q1', async () => request);
+    // A client-held follow-up behind no run would be sent within 100ms.
+    await vi.advanceTimersByTimeAsync(300);
+    expect(sendMessage).not.toHaveBeenCalled();
+
+    // The next check appends the id again; the server never held it.
+    await vi.advanceTimersByTimeAsync(SERVER_QUEUE_POLL_MS);
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+  });
+
   it('withdraws from the server a follow-up removed from the tray while it was being queued', async () => {
     startRun();
     let resolveAppend!: (value: { id: string; length: number; queued: true }) => void;
@@ -156,7 +214,7 @@ describe('handOffQueuedMessage', () => {
     );
     const remove = vi
       .spyOn(aiAgentService, 'removeQueuedFollowUp')
-      .mockResolvedValue({ removed: true });
+      .mockResolvedValue({ removed: true, state: 'removed' });
     get().enqueueMessage(key, queued('q1', { serverDelivery: 'appending' }));
 
     const handOff = handOffQueuedMessage(get, key, context, 'q1', async () => request);
@@ -228,10 +286,10 @@ describe('server queue watch while a run delivers', () => {
 
   it('keeps showing one it could not withdraw because a run is delivering it', async () => {
     get().enqueueMessage(key, queued('q1', { serverDelivery: 'server', serverRequest: request }));
-    vi.spyOn(aiAgentService, 'removeQueuedFollowUp').mockResolvedValue({ removed: false });
-    vi.spyOn(aiAgentService, 'listQueuedFollowUps').mockResolvedValue([
-      pending('q1', { delivering: true }),
-    ]);
+    vi.spyOn(aiAgentService, 'removeQueuedFollowUp').mockResolvedValue({
+      removed: false,
+      state: 'delivering',
+    });
 
     await expect(withdrawQueuedMessage(get, key, 'q1')).resolves.toBe(false);
     expect(queue()).toEqual([expect.objectContaining({ id: 'q1', serverDelivery: 'server' })]);
@@ -247,7 +305,11 @@ describe('server queue watch while a run delivers', () => {
 
     await handOffQueuedMessage(get, key, context, 'q1', async () => request);
 
-    expect(append).toHaveBeenCalledWith({ editorData, id: 'q1', request });
+    expect(append).toHaveBeenCalledWith({
+      composer: { editorData, filesPreview: undefined },
+      id: 'q1',
+      request,
+    });
   });
 });
 
@@ -271,7 +333,7 @@ describe('server queue watch after the run ended without taking them', () => {
       .mockResolvedValue([pending('q1', { createdAt: 1, prompt: 'q1' })]);
     const remove = vi
       .spyOn(aiAgentService, 'removeQueuedFollowUp')
-      .mockResolvedValue({ removed: true });
+      .mockResolvedValue({ removed: true, state: 'removed' });
     get().enqueueMessage(key, queued('q1', { serverDelivery: 'appending' }));
 
     await handOffQueuedMessage(get, key, context, 'q1', async () => request);
@@ -297,7 +359,7 @@ describe('server queue watch after the run ended without taking them', () => {
     ]);
     const remove = vi
       .spyOn(aiAgentService, 'removeQueuedFollowUp')
-      .mockResolvedValue({ removed: true });
+      .mockResolvedValue({ removed: true, state: 'removed' });
     get().enqueueMessage(key, queued('q1', { serverDelivery: 'appending' }));
     await handOffQueuedMessage(get, key, context, 'q1', async () => request);
 
@@ -386,6 +448,20 @@ describe('restoreServerQueuedMessages', () => {
     });
   });
 
+  it('brings back attachment previews, so the tray shows them and Edit restores them', async () => {
+    const filesPreview = [
+      { id: 'f1', mimeType: 'image/png', name: 'a.png', url: 'https://x/a.png' },
+    ];
+    vi.spyOn(aiAgentService, 'listQueuedFollowUps')
+      .mockResolvedValueOnce([pending('q1', { fileIds: ['f1'], filesPreview })])
+      .mockResolvedValue([]);
+
+    // Nothing runs: e.g. its next turn failed to start and it went back to wait.
+    await restoreServerQueuedMessages(get, context);
+
+    expect(queue()[0]).toMatchObject({ files: ['f1'], filesPreview, serverDelivery: 'server' });
+  });
+
   it('adds nothing twice and stays out of threads', async () => {
     const list = vi
       .spyOn(aiAgentService, 'listQueuedFollowUps')
@@ -407,7 +483,10 @@ describe('withdrawQueuedMessage / reclaimServerQueuedMessages', () => {
 
   it('takes a follow-up back from the server before it is edited or sent now', async () => {
     holdOnServer('q1');
-    vi.spyOn(aiAgentService, 'removeQueuedFollowUp').mockResolvedValue({ removed: true });
+    vi.spyOn(aiAgentService, 'removeQueuedFollowUp').mockResolvedValue({
+      removed: true,
+      state: 'removed',
+    });
 
     await expect(withdrawQueuedMessage(get, key, 'q1')).resolves.toBe(true);
     expect(queue()).toHaveLength(0);
@@ -415,7 +494,10 @@ describe('withdrawQueuedMessage / reclaimServerQueuedMessages', () => {
 
   it('reports a follow-up the server already took, so it is not sent twice', async () => {
     holdOnServer('q1');
-    vi.spyOn(aiAgentService, 'removeQueuedFollowUp').mockResolvedValue({ removed: false });
+    vi.spyOn(aiAgentService, 'removeQueuedFollowUp').mockResolvedValue({
+      removed: false,
+      state: 'taken',
+    });
 
     await expect(withdrawQueuedMessage(get, key, 'q1')).resolves.toBe(false);
     expect(queue()).toHaveLength(0);
@@ -424,9 +506,9 @@ describe('withdrawQueuedMessage / reclaimServerQueuedMessages', () => {
   it('after a stop, keeps here what the server still had and drops what it took', async () => {
     holdOnServer('waiting');
     holdOnServer('taken');
-    vi.spyOn(aiAgentService, 'removeQueuedFollowUp').mockImplementation(async ({ id }) => ({
-      removed: id === 'waiting',
-    }));
+    vi.spyOn(aiAgentService, 'removeQueuedFollowUp').mockImplementation(async ({ id }) =>
+      id === 'waiting' ? { removed: true, state: 'removed' } : { removed: false, state: 'taken' },
+    );
 
     await reclaimServerQueuedMessages(get, key);
 

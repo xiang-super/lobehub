@@ -934,7 +934,7 @@ export class OperationActionsImpl {
   updateQueuedMessage = (
     contextKey: string,
     messageId: string,
-    patch: Partial<Pick<QueuedMessage, 'serverDelivery' | 'serverRequest'>>,
+    patch: Partial<Pick<QueuedMessage, 'serverDelivery' | 'serverRequest' | 'serverUnconfirmed'>>,
   ): void => {
     this.#set(
       produce((state: ChatStore) => {

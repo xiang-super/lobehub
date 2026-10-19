@@ -7,11 +7,12 @@ import { agentSteerQueueRouter } from '../agentSteerQueue';
 
 const mocks = vi.hoisted(() => ({
   append: vi.fn(),
-  delivering: vi.fn(),
+  entryState: vi.fn(),
   isRunningOperationAlive: vi.fn(),
   list: vi.fn(),
   liveCandidates: vi.fn(),
   remove: vi.fn(),
+  snapshot: vi.fn(),
 }));
 
 vi.mock('@/database/models/topic', () => ({
@@ -23,9 +24,9 @@ vi.mock('@/server/services/redis', () => ({
   redisService: {
     steerQueue: {
       append: mocks.append,
-      delivering: mocks.delivering,
-      list: mocks.list,
+      entryState: mocks.entryState,
       remove: mocks.remove,
+      snapshot: mocks.snapshot,
     },
   },
 }));
@@ -82,7 +83,36 @@ describe('agentSteerQueueRouter.append', () => {
     mocks.isRunningOperationAlive.mockResolvedValue(true);
     mocks.append.mockResolvedValue(1);
     mocks.remove.mockResolvedValue(true);
+    mocks.entryState.mockResolvedValue('absent');
   });
+
+  // ROOT CAUSE:
+  //
+  // A retry of an append whose answer was lost went through the liveness
+  // check first. Had the run ended meanwhile, it answered `idle` and the
+  // client sent the follow-up itself while the server still held (or had
+  // delivered) the first copy — the follow-up ran twice.
+  //
+  // Before: liveness decided first.
+  // After: what the server already holds for that id decides.
+  it.each([
+    ['still waiting', 'queued', 1],
+    ['being delivered', 'delivering', 0],
+    ['delivered', 'taken', 0],
+  ] as const)(
+    'answers a retry of an entry %s as queued, whatever the run',
+    async (_l, state, length) => {
+      mocks.entryState.mockResolvedValue(state);
+      mocks.liveCandidates.mockReturnValue([]);
+
+      await expect(caller().append(appendInput)).resolves.toEqual({
+        id: 'q-1',
+        length,
+        queued: true,
+      });
+      expect(mocks.append).not.toHaveBeenCalled();
+    },
+  );
 
   it('queues behind the caller’s own live run, keeping only what a later turn can use', async () => {
     await expect(caller().append(appendInput)).resolves.toEqual({
@@ -200,12 +230,13 @@ describe('agentSteerQueueRouter.append', () => {
 describe('agentSteerQueueRouter.list / remove', () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    mocks.list.mockResolvedValue([
-      { createdAt: 1, id: 'mine', request: { prompt: 'a' }, userId: 'user-1' },
-      { createdAt: 2, id: 'theirs', request: { prompt: 'b' }, userId: 'user-2' },
-    ]);
-    mocks.delivering.mockResolvedValue([]);
-    mocks.remove.mockResolvedValue(true);
+    mocks.snapshot.mockResolvedValue({
+      delivering: [],
+      waiting: [
+        { createdAt: 1, id: 'mine', request: { prompt: 'a' }, userId: 'user-1' },
+        { createdAt: 2, id: 'theirs', request: { prompt: 'b' }, userId: 'user-2' },
+      ],
+    });
   });
 
   it('lists only the caller’s own follow-ups', async () => {
@@ -221,27 +252,29 @@ describe('agentSteerQueueRouter.list / remove', () => {
   // returns it to the queue — invisible until another run or a reload.
   //
   // Before: only waiting entries were listed.
-  // After: taken-but-unconfirmed ones are listed as `delivering`, in order,
-  // with what a reloaded client needs to resend them as typed.
+  // After: taken-but-unconfirmed ones are listed as `delivering`, from one
+  // atomic read, with what a reloaded client needs to resend them as typed.
   it('lists follow-ups a run took but has not confirmed as delivering', async () => {
-    const editorData = { root: { type: 'root' } };
-    mocks.delivering.mockResolvedValue([
-      {
-        composer: { editorData },
-        createdAt: 0,
-        id: 'taken',
-        request: { prompt: 'z', selectedSkillIds: ['s1'] },
-        userId: 'user-1',
-      },
-      { createdAt: 3, id: 'other', request: { prompt: 'y' }, userId: 'user-2' },
-      // Returned to the queue between the two reads: listed once, as waiting.
-      { createdAt: 1, id: 'mine', request: { prompt: 'a' }, userId: 'user-1' },
-    ]);
+    const composer = { editorData: { root: { type: 'root' } }, filesPreview: [{ id: 'f1' }] };
+    mocks.snapshot.mockResolvedValue({
+      delivering: [
+        {
+          composer,
+          createdAt: 0,
+          id: 'taken',
+          request: { prompt: 'z', selectedSkillIds: ['s1'] },
+          userId: 'user-1',
+        },
+        { createdAt: 3, id: 'other', request: { prompt: 'y' }, userId: 'user-2' },
+      ],
+      waiting: [{ createdAt: 1, id: 'mine', request: { prompt: 'a' }, userId: 'user-1' }],
+    });
 
     await expect(caller().list({ topicId: 'tpc-1' })).resolves.toEqual([
       expect.objectContaining({
         delivering: true,
-        editorData,
+        editorData: composer.editorData,
+        filesPreview: composer.filesPreview,
         id: 'taken',
         selectedSkillIds: ['s1'],
       }),
@@ -249,13 +282,22 @@ describe('agentSteerQueueRouter.list / remove', () => {
     ]);
   });
 
-  it('removes only the caller’s own follow-ups', async () => {
-    await expect(caller().remove({ id: 'theirs', topicId: 'tpc-1' })).resolves.toEqual({
-      removed: false,
-    });
+  it.each([
+    ['removed', true],
+    ['delivering', false],
+    ['taken', false],
+    ['absent', false],
+  ] as const)('withdraws in one step and says where it is: %s', async (state, removed) => {
+    mocks.entryState.mockResolvedValue(state);
+
     await expect(caller().remove({ id: 'mine', topicId: 'tpc-1' })).resolves.toEqual({
-      removed: true,
+      removed,
+      state,
     });
-    expect(mocks.remove).toHaveBeenCalledTimes(1);
+    expect(mocks.entryState).toHaveBeenCalledWith(
+      { threadId: null, topicId: 'tpc-1', userId: 'user-1' },
+      'mine',
+      { remove: true },
+    );
   });
 });

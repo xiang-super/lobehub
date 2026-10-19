@@ -326,6 +326,12 @@ export interface QueuedMessage {
    * could be queued on the server; such an item may be handed over later.
    */
   serverRequest?: QueuedFollowUpRequest;
+  /**
+   * The append's answer was lost, so it may or may not be on the server. It
+   * stays the server's — never sent from here — until the same id is appended
+   * again and the server says where it is.
+   */
+  serverUnconfirmed?: boolean;
 }
 
 /** Whether only this client holds the queued message, so only it can send it. */

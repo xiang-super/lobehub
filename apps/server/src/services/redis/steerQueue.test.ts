@@ -81,8 +81,23 @@ const createFakeRedis = () => {
       return list.filter((item) => takes(item, op)).length + lapsed;
     }
     if (script.includes('return inFlight(KEYS[1])')) return inFlight(key);
-    if (script.includes('local out = {}'))
-      return [...batchesOf(key).values()].flatMap((batch) => batch.items);
+    if (script.includes('local delivering = {}'))
+      return [list, [...batchesOf(keys[1]).values()].flatMap((batch) => batch.items)];
+    if (script.includes("return 'absent'")) {
+      const [, takenKey, drainedKey] = keys;
+      const [id, mode] = args;
+      const index = list.findIndex((item) => header(item).id === id);
+      if (index >= 0) {
+        if (mode !== 'remove') return 'queued';
+        list.splice(index, 1);
+        return 'removed';
+      }
+      const inBatch = [...batchesOf(drainedKey).values()].some((batch) =>
+        batch.items.some((item) => header(item).id === id),
+      );
+      if (inBatch) return 'delivering';
+      return setOf(takenKey).has(id) ? 'taken' : 'absent';
+    }
     if (script.includes('SISMEMBER')) {
       const [id, item, ttl, max] = args;
       if (setOf(keys[1]).has(id)) return -2;
@@ -155,16 +170,30 @@ describe('redisService.steerQueue', () => {
     await q.append(scope, entry('b'), 'op-1');
     await q.drain(scope, 'op-1', [], 'd1');
 
-    await expect(q.delivering(scope)).resolves.toEqual([entry('a'), entry('b')]);
+    await expect(q.snapshot(scope)).resolves.toEqual({
+      delivering: [entry('a'), entry('b')],
+      waiting: [],
+    });
 
     // `b` cannot join and goes back to wait; `a` is still on its way.
     await q.settle(scope, 'd1', ['b']);
-    await expect(q.delivering(scope)).resolves.toEqual([entry('a')]);
-    expect(await ids()).toEqual(['b']);
+    await expect(q.snapshot(scope)).resolves.toEqual({
+      delivering: [entry('a')],
+      waiting: [expect.objectContaining({ id: 'b' })],
+    });
+    await expect(q.entryState(scope, 'a')).resolves.toBe('delivering');
 
     // `a` delivered.
     await q.settle(scope, 'd1');
-    await expect(q.delivering(scope)).resolves.toEqual([]);
+    await expect(q.entryState(scope, 'a')).resolves.toBe('taken');
+  });
+
+  it('withdraws only a waiting entry, and says where any other one is', async () => {
+    await q.append(scope, entry('a'), 'op-1');
+
+    await expect(q.entryState(scope, 'a')).resolves.toBe('queued');
+    await expect(q.entryState(scope, 'a', { remove: true })).resolves.toBe('removed');
+    await expect(q.entryState(scope, 'a', { remove: true })).resolves.toBe('absent');
   });
 
   it('reads a drained batch back when its response was lost', async () => {

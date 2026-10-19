@@ -60,16 +60,20 @@ const AppendSchema = z.object({
    * The composer state the follow-up was sent from, stored opaquely so a
    * reloaded client can show and resend it as typed. Dropped above the cap.
    */
-  composer: z.object({ editorData: z.record(z.string(), z.unknown()).optional() }).optional(),
+  composer: z
+    .object({
+      editorData: z.record(z.string(), z.unknown()).optional(),
+      /** Attachment previews (id, name, type, url) the tray and Edit rebuild uploads from. */
+      filesPreview: z.array(z.record(z.string(), z.unknown())).max(50).optional(),
+    })
+    .optional(),
   request: QueuedRequestSchema,
 });
 
 /** Composer state kept with an entry; larger editor documents are not stored. */
 const MAX_COMPOSER_BYTES = 32 * 1024;
 const storedComposer = (composer: z.infer<typeof AppendSchema>['composer']) =>
-  composer?.editorData && JSON.stringify(composer.editorData).length <= MAX_COMPOSER_BYTES
-    ? { editorData: composer.editorData }
-    : undefined;
+  composer && JSON.stringify(composer).length <= MAX_COMPOSER_BYTES ? composer : undefined;
 
 const steerQueueProcedure = wsCompatProcedure.use(serverDatabase);
 const steerQueueWriteProcedure = steerQueueProcedure.use(withScopedPermission('message:create'));
@@ -117,6 +121,15 @@ export const agentSteerQueueRouter = router({
     });
 
     const scope = toScope({ threadId: request.appContext?.threadId, topicId }, ctx.userId);
+    // A retry of an append whose answer was lost: what the server already holds
+    // decides, before liveness — the run may have ended since, but the entry is
+    // still delivered (or was), so the client must never send it too.
+    if (input.id) {
+      const state = await redisService.steerQueue.entryState(scope, input.id);
+      if (state === 'queued') return { id: input.id, length: 1, queued: true as const };
+      if (state === 'delivering' || state === 'taken')
+        return { id: input.id, length: 0, queued: true as const };
+    }
     const liveRuns = await findOwnLiveRuns(
       { db: ctx.serverDB, workspaceId: ctx.workspaceId },
       scope,
@@ -195,10 +208,7 @@ export const agentSteerQueueRouter = router({
     });
 
     const scope = toScope(input, ctx.userId);
-    const [waiting, delivering] = await Promise.all([
-      redisService.steerQueue.list<QueuedFollowUp>(scope),
-      redisService.steerQueue.delivering<QueuedFollowUp>(scope),
-    ]);
+    const { delivering, waiting } = await redisService.steerQueue.snapshot<QueuedFollowUp>(scope);
     const own = (entry: QueuedFollowUp) => entry.userId === ctx.userId;
     const waitingIds = new Set(waiting.map((entry) => entry.id));
     return [
@@ -214,6 +224,7 @@ export const agentSteerQueueRouter = router({
         delivering: isDelivering,
         editorData: entry.composer?.editorData,
         fileIds: entry.request.fileIds,
+        filesPreview: entry.composer?.filesPreview,
         id: entry.id,
         mentionedAgents: entry.request.mentionedAgents,
         prompt: entry.request.prompt,
@@ -223,17 +234,17 @@ export const agentSteerQueueRouter = router({
   }),
 
   /**
-   * Withdraw a queued follow-up. `removed: false` means it is gone already —
-   * most likely a finishing run just started it.
+   * Withdraw a queued follow-up, in one step with reading where it is:
+   * `removed`, or why not — `delivering` (a run took it and has not settled;
+   * it may still come back), `taken` (delivered) or `absent` (never stored).
+   * The queue is the caller's own, so only their follow-ups can be withdrawn.
    */
   remove: steerQueueWriteProcedure
     .input(ScopeSchema.extend({ id: z.string() }))
     .mutation(async ({ input, ctx }) => {
-      const scope = toScope(input, ctx.userId);
-      const entries = await redisService.steerQueue.list<QueuedFollowUp>(scope);
-      const entry = entries.find((item) => item.id === input.id);
-      if (!entry || entry.userId !== ctx.userId) return { removed: false };
-
-      return { removed: await redisService.steerQueue.remove(scope, input.id) };
+      const state = await redisService.steerQueue.entryState(toScope(input, ctx.userId), input.id, {
+        remove: true,
+      });
+      return { removed: state === 'removed', state: state ?? ('absent' as const) };
     }),
 });

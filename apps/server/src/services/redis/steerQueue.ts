@@ -149,15 +149,49 @@ return length
 /** KEYS[1] = queue */
 const LIST_SCRIPT = `return redis.call('LRANGE', KEYS[1], 0, -1)`;
 
-/** Every entry in a drained batch. KEYS[1] = drained batches */
-const IN_FLIGHT_SCRIPT = `${LUA_HELPERS}
-local out = {}
-for _, batch in ipairs(redis.call('HVALS', KEYS[1])) do
+/**
+ * Waiting entries and those in drained batches, read in one step so an entry
+ * moving between the two is never missed.
+ *
+ * KEYS[1] = queue; KEYS[2] = drained batches. Returns `{ waiting, delivering }`.
+ */
+const SNAPSHOT_SCRIPT = `${LUA_HELPERS}
+local delivering = {}
+for _, batch in ipairs(redis.call('HVALS', KEYS[2])) do
   local _, items = splitBatch(batch)
-  for _, item in ipairs(items) do table.insert(out, item) end
+  for _, item in ipairs(items) do table.insert(delivering, item) end
 end
-return out
+return { redis.call('LRANGE', KEYS[1], 0, -1), delivering }
 `;
+
+/**
+ * Where one entry is, in one step — and with ARGV[2] = 'remove', takes it out
+ * when it is still waiting. Returns `removed`, `queued`, `delivering` (a run
+ * took it and has not settled), `taken` (delivered) or `absent`.
+ *
+ * KEYS[1] = queue; KEYS[2] = taken ids; KEYS[3] = drained batches; ARGV[1] = id
+ */
+const ENTRY_STATE_SCRIPT = `${LUA_HELPERS}
+for _, item in ipairs(redis.call('LRANGE', KEYS[1], 0, -1)) do
+  if header(item) == ARGV[1] then
+    if ARGV[2] == 'remove' then
+      redis.call('LREM', KEYS[1], 1, item)
+      return 'removed'
+    end
+    return 'queued'
+  end
+end
+for _, batch in ipairs(redis.call('HVALS', KEYS[3])) do
+  local _, items = splitBatch(batch)
+  for _, item in ipairs(items) do
+    if header(item) == ARGV[1] then return 'delivering' end
+  end
+end
+if redis.call('SISMEMBER', KEYS[2], ARGV[1]) == 1 then return 'taken' end
+return 'absent'
+`;
+
+export type SteerQueueEntryState = 'absent' | 'delivering' | 'queued' | 'removed' | 'taken';
 
 /**
  * Entries a run would take: queued ones it owns, plus any in a lapsed batch
@@ -471,14 +505,42 @@ export const steerQueue = {
   },
 
   /**
-   * Entries a drain took that are not settled yet: on their way into a run, or
-   * back to the queue should that fail (also when their lease lapses).
+   * The entries not delivered yet, read atomically: `waiting` ones, and
+   * `delivering` ones a drain took that are not settled — on their way into a
+   * run, or back to the queue should that fail (also when their lease lapses).
    */
-  async delivering<T extends SteerQueueEntry>(scope: SteerQueueScope): Promise<T[]> {
+  async snapshot<T extends SteerQueueEntry>(
+    scope: SteerQueueScope,
+  ): Promise<{ delivering: T[]; waiting: T[] }> {
     const redis = await getClient();
-    if (!redis) return [];
+    if (!redis) return { delivering: [], waiting: [] };
 
-    return parseEntries<T>(await redis.eval<unknown>(IN_FLIGHT_SCRIPT, 1, drainedKeyOf(scope)));
+    const raw = await redis.eval<unknown>(SNAPSHOT_SCRIPT, 2, keyOf(scope), drainedKeyOf(scope));
+    const [waiting, delivering] = Array.isArray(raw) ? raw : [];
+    return { delivering: parseEntries<T>(delivering), waiting: parseEntries<T>(waiting) };
+  },
+
+  /**
+   * Where one entry is (see {@link SteerQueueEntryState}); with `remove`, takes
+   * it out in the same step when it is still waiting. `undefined` without Redis.
+   */
+  async entryState(
+    scope: SteerQueueScope,
+    id: string,
+    options?: { remove?: boolean },
+  ): Promise<SteerQueueEntryState | undefined> {
+    const redis = await getClient();
+    if (!redis) return;
+
+    return (await redis.eval<string>(
+      ENTRY_STATE_SCRIPT,
+      3,
+      keyOf(scope),
+      takenKeyOf(scope),
+      drainedKeyOf(scope),
+      id,
+      options?.remove ? 'remove' : 'peek',
+    )) as SteerQueueEntryState;
   },
 
   /**

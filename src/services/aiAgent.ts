@@ -338,8 +338,8 @@ class AiAgentService {
    * stored and this client must send it itself.
    */
   async appendQueuedFollowUp(params: {
-    /** Composer state to keep with it, so a reloaded page can resend it as typed. */
-    editorData?: Record<string, any>;
+    /** Composer state to keep with it, so a reloaded page can show and resend it as typed. */
+    composer?: { editorData?: Record<string, any>; filesPreview?: Record<string, any>[] };
     id: string;
     request: QueuedFollowUpRequest;
   }) {
@@ -347,7 +347,7 @@ class AiAgentService {
     const llmExecutor = buildLlmExecutorDeclaration();
 
     return await lambdaClient.agentSteerQueue.append.mutate({
-      ...(params.editorData && { composer: { editorData: params.editorData } }),
+      ...(params.composer && { composer: params.composer }),
       id: params.id,
       request: {
         clientProtocol,

@@ -5,7 +5,11 @@ import { aiAgentService, type QueuedFollowUpRequest } from '@/services/aiAgent';
 import { topicService } from '@/services/topic';
 import { topicSelectors } from '@/store/chat/selectors';
 import { operationSelectors } from '@/store/chat/slices/operation/selectors';
-import { isClientHeldQueuedMessage, type QueuedMessage } from '@/store/chat/slices/operation/types';
+import {
+  isClientHeldQueuedMessage,
+  type QueuedFile,
+  type QueuedMessage,
+} from '@/store/chat/slices/operation/types';
 import type { ChatStore } from '@/store/chat/store';
 import { messageMapKey } from '@/store/chat/utils/messageMapKey';
 import { isTrpcErrorCode } from '@/utils/trpcError';
@@ -82,15 +86,27 @@ const sendIfIdle = (get: Get, contextKey: string, context: ConversationContext) 
   scheduleQueuedFollowUp(get, context, operationIds.at(-1) ?? '');
 };
 
+/** The server refused before storing anything; any other failure leaves it unknown. */
+const DEFINITE_REJECTIONS = ['BAD_REQUEST', 'FORBIDDEN', 'NOT_FOUND', 'UNAUTHORIZED'] as const;
+const isDefiniteRejection = (error: unknown) =>
+  DEFINITE_REJECTIONS.some((code) => isTrpcErrorCode(error, code));
+
 const appendWithRetry = async (
   id: string,
   request: QueuedFollowUpRequest,
-  editorData?: Record<string, any>,
+  message?: QueuedMessage,
 ) => {
   let lastError: unknown;
   for (let attempt = 0; attempt < APPEND_ATTEMPTS; attempt++) {
     try {
-      return await aiAgentService.appendQueuedFollowUp({ editorData, id, request });
+      return await aiAgentService.appendQueuedFollowUp({
+        composer: message && {
+          editorData: message.editorData,
+          filesPreview: message.filesPreview as Record<string, any>[] | undefined,
+        },
+        id,
+        request,
+      });
     } catch (error) {
       lastError = error;
       if (!isTrpcErrorCode(error, 'SERVICE_UNAVAILABLE')) break;
@@ -138,25 +154,30 @@ export const handOffQueuedMessage = (
 
     get().updateQueuedMessage(contextKey, id, { serverDelivery: 'appending' });
     let queued = false;
+    let unconfirmed = false;
     try {
-      queued = (await appendWithRetry(id, request, findQueued(get, contextKey, id)?.editorData))
-        .queued;
+      queued = (await appendWithRetry(id, request, findQueued(get, contextKey, id))).queued;
     } catch (error) {
-      // Unknown whether it was stored. Keeping it here can at worst send it
-      // twice; dropping it could lose it.
       console.error('[serverSteerQueue] queueing on the server failed:', error);
+      // Unless refused outright it may have been stored, and sending it from
+      // here too could run it twice. It stays the server's until a retry of
+      // the same id says where it is.
+      unconfirmed = !isDefiniteRejection(error);
     }
 
     if (!findQueued(get, contextKey, id)) {
       // Withdrawn while the append was in flight.
-      if (queued)
+      if (queued || unconfirmed)
         await aiAgentService.removeQueuedFollowUp({ ...surfaceOf(request), id }).catch(() => {});
       return;
     }
-    if (!queued) return keepHere();
+    if (!queued && !unconfirmed) return keepHere();
 
-    log('[%s] %s queued on the server', contextKey, id);
-    get().updateQueuedMessage(contextKey, id, { serverDelivery: 'server' });
+    log('[%s] %s queued on the server%s', contextKey, id, unconfirmed ? ' (unconfirmed)' : '');
+    get().updateQueuedMessage(contextKey, id, {
+      serverDelivery: 'server',
+      serverUnconfirmed: unconfirmed || undefined,
+    });
     watchServerQueue(get, contextKey, context);
   };
 
@@ -226,6 +247,37 @@ const onServerQueueDelivered = async (
 };
 
 /**
+ * An append whose answer was lost and that the server does not list: append
+ * the same id again, which never stores it twice, and let the answer say where
+ * it is — waiting, delivered, or never stored (then this client sends it).
+ */
+const reconcileUnconfirmed = async (
+  get: Get,
+  contextKey: string,
+  context: ConversationContext,
+  message: QueuedMessage,
+) => {
+  try {
+    const result = await appendWithRetry(message.id, message.serverRequest!, message);
+    if (result.queued && result.length > 0) {
+      get().updateQueuedMessage(contextKey, message.id, { serverUnconfirmed: undefined });
+      return;
+    }
+    // Already taken by a run: delivered.
+    if (result.queued) return get().removeQueuedMessage(contextKey, message.id);
+  } catch (error) {
+    if (!isDefiniteRejection(error)) return;
+  }
+  // Not on the server and refused now: only this client holds it.
+  get().updateQueuedMessage(contextKey, message.id, {
+    serverDelivery: undefined,
+    serverUnconfirmed: undefined,
+  });
+  get().internal_syncQueuedMessagesFlag(contextKey);
+  sendIfIdle(get, contextKey, context);
+};
+
+/**
  * Follow the conversation's follow-ups on the server until all of them left
  * its queue — joined into the run or started as the next turn — and drop
  * each from the tray as it goes.
@@ -252,7 +304,15 @@ export const watchServerQueue = (get: Get, contextKey: string, context: Conversa
           (entry) => entry.id,
         ),
       );
-      const delivered = held.filter((message) => !notDelivered.has(message.id));
+      for (const message of held) {
+        if (!message.serverUnconfirmed) continue;
+        if (notDelivered.has(message.id))
+          get().updateQueuedMessage(contextKey, message.id, { serverUnconfirmed: undefined });
+        else await reconcileUnconfirmed(get, contextKey, context, message);
+      }
+      const delivered = held.filter(
+        (message) => !message.serverUnconfirmed && !notDelivered.has(message.id),
+      );
       for (const message of delivered) {
         if (findQueued(get, contextKey, message.id)?.serverDelivery === 'server')
           get().removeQueuedMessage(contextKey, message.id);
@@ -301,6 +361,8 @@ export const restoreServerQueuedMessages = async (
   const { agentId, topicId } = context;
   if (!agentId || !topicId) return;
   if (context.threadId || context.agentShareId || context.topicShareId) return;
+  // Only a Gateway conversation ever queues on the server.
+  if (!get().isGatewayModeEnabled?.(agentId)) return;
 
   const surface = { threadId: null, topicId };
   const pending = await aiAgentService.listQueuedFollowUps(surface).catch((error) => {
@@ -319,6 +381,10 @@ export const restoreServerQueuedMessages = async (
       // The composer state it was sent from, so a local resend keeps its
       // selected skills, tools and mentions.
       ...(entry.editorData && { editorData: entry.editorData }),
+      // Previews let the tray show its attachments and Edit put them back.
+      ...(entry.filesPreview?.length && {
+        filesPreview: entry.filesPreview as unknown as QueuedFile[],
+      }),
       ...(entry.fileIds?.length && { files: entry.fileIds }),
       id: entry.id,
       interruptMode: 'soft',
@@ -338,12 +404,6 @@ export const restoreServerQueuedMessages = async (
   watchServerQueue(get, contextKey, context);
 };
 
-/** Whether a run took the follow-up and has not confirmed its delivery yet. */
-const isDelivering = async (request: QueuedFollowUpRequest, id: string): Promise<boolean> => {
-  const pending = await aiAgentService.listQueuedFollowUps(surfaceOf(request)).catch(() => []);
-  return pending.some((entry) => entry.id === id && entry.delivering);
-};
-
 /**
  * Take the follow-ups back from the server queue, so only this client holds
  * them again — for a stopped run, which starts nothing next. The ones the
@@ -359,14 +419,18 @@ export const reclaimServerQueuedMessages = (get: Get, contextKey: string): Promi
     for (const message of queueOf(get, contextKey)) {
       if (message.serverDelivery !== 'server' || !message.serverRequest) continue;
       try {
-        const { removed } = await aiAgentService.removeQueuedFollowUp({
+        const { state } = await aiAgentService.removeQueuedFollowUp({
           ...surfaceOf(message.serverRequest),
           id: message.id,
         });
-        if (removed)
-          get().updateQueuedMessage(contextKey, message.id, { serverDelivery: undefined });
-        else if (!(await isDelivering(message.serverRequest, message.id)))
-          get().removeQueuedMessage(contextKey, message.id);
+        // Removed, or never stored: only this client holds it now.
+        if (state === 'removed' || state === 'absent')
+          get().updateQueuedMessage(contextKey, message.id, {
+            serverDelivery: undefined,
+            serverUnconfirmed: undefined,
+          });
+        // Delivered. One still `delivering` stays the server's until it lands or comes back.
+        else if (state === 'taken') get().removeQueuedMessage(contextKey, message.id);
       } catch (error) {
         // Still on the server, which delivers it on the conversation's next run.
         console.error('[serverSteerQueue] taking a follow-up back failed:', error);
@@ -393,14 +457,15 @@ export const withdrawQueuedMessage = async (
   if (!message) return false;
 
   if (message.serverDelivery === 'server' && message.serverRequest) {
-    const { removed } = await aiAgentService.removeQueuedFollowUp({
+    const { state } = await aiAgentService.removeQueuedFollowUp({
       ...surfaceOf(message.serverRequest),
       id,
     });
-    // Taken but not confirmed: it stays shown until it lands or comes back.
-    if (removed || !(await isDelivering(message.serverRequest, id)))
-      get().removeQueuedMessage(contextKey, id);
-    return removed;
+    // Taken but not settled: it stays shown until it lands or comes back.
+    if (state === 'delivering') return false;
+    get().removeQueuedMessage(contextKey, id);
+    // Removed in the same step, or never stored: the server will not deliver it.
+    return state === 'removed' || state === 'absent';
   }
 
   get().removeQueuedMessage(contextKey, id);

@@ -41,7 +41,7 @@ export interface QueuedFollowUp extends SteerQueueEntry {
    * client that reloads can show and resend it exactly as typed (selections,
    * mentions). Never used to run it.
    */
-  composer?: { editorData?: Record<string, unknown> };
+  composer?: { editorData?: Record<string, unknown>; filesPreview?: Record<string, unknown>[] };
   request: QueuedFollowUpRequest;
   /** Who queued it; only the run owner's own follow-ups are started for them. */
   userId: string;
