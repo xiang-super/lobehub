@@ -170,7 +170,16 @@ export const agentSteerQueueRouter = router({
       // retries with the same entry id, which appends at most once.
       throw new TRPCError({ cause: error, code: 'SERVICE_UNAVAILABLE', message: error.message });
     }
-    if (length === undefined) return { queued: false as const, reason: 'unavailable' as const };
+    // Taken back after its command failed: definitely not stored.
+    if (length === 'notStored') return { queued: false as const, reason: 'unavailable' as const };
+    if (length === undefined) {
+      // No Redis in this deployment: nothing was or ever is stored, send directly.
+      if (!redisService.steerQueue.isConfigured())
+        return { queued: false as const, reason: 'unavailable' as const };
+      // An outage: an earlier try of this id may have been stored. Unknown —
+      // the client keeps it the server's and retries the same id.
+      throw new TRPCError({ code: 'SERVICE_UNAVAILABLE', message: 'Queue unavailable' });
+    }
     if (length === 'full') return { queued: false as const, reason: 'full' as const };
     // A retry of a write that landed and was already taken by its run: it is
     // on its way, so the client must not send it again.
@@ -208,7 +217,18 @@ export const agentSteerQueueRouter = router({
     });
 
     const scope = toScope(input, ctx.userId);
-    const { delivering, waiting } = await redisService.steerQueue.snapshot<QueuedFollowUp>(scope);
+    let snapshot: { delivering: QueuedFollowUp[]; waiting: QueuedFollowUp[] };
+    try {
+      snapshot = await redisService.steerQueue.snapshot<QueuedFollowUp>(scope);
+    } catch (error) {
+      // Unknown, not empty: a client must keep what it shows as queued.
+      throw new TRPCError({
+        cause: error,
+        code: 'SERVICE_UNAVAILABLE',
+        message: 'Queue unavailable',
+      });
+    }
+    const { delivering, waiting } = snapshot;
     const own = (entry: QueuedFollowUp) => entry.userId === ctx.userId;
     const waitingIds = new Set(waiting.map((entry) => entry.id));
     return [
@@ -245,6 +265,10 @@ export const agentSteerQueueRouter = router({
       const state = await redisService.steerQueue.entryState(toScope(input, ctx.userId), input.id, {
         remove: true,
       });
-      return { removed: state === 'removed', state: state ?? ('absent' as const) };
+      // Without Redis nothing is known: it may still be delivered, so it must
+      // neither read as withdrawn nor be resent.
+      if (!state)
+        throw new TRPCError({ code: 'SERVICE_UNAVAILABLE', message: 'Queue unavailable' });
+      return { removed: state === 'removed', state };
     }),
 });

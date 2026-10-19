@@ -8,6 +8,7 @@ import { agentSteerQueueRouter } from '../agentSteerQueue';
 const mocks = vi.hoisted(() => ({
   append: vi.fn(),
   entryState: vi.fn(),
+  isConfigured: vi.fn(),
   isRunningOperationAlive: vi.fn(),
   list: vi.fn(),
   liveCandidates: vi.fn(),
@@ -25,6 +26,7 @@ vi.mock('@/server/services/redis', () => ({
     steerQueue: {
       append: mocks.append,
       entryState: mocks.entryState,
+      isConfigured: mocks.isConfigured,
       remove: mocks.remove,
       snapshot: mocks.snapshot,
     },
@@ -84,6 +86,7 @@ describe('agentSteerQueueRouter.append', () => {
     mocks.append.mockResolvedValue(1);
     mocks.remove.mockResolvedValue(true);
     mocks.entryState.mockResolvedValue('absent');
+    mocks.isConfigured.mockReturnValue(true);
   });
 
   // ROOT CAUSE:
@@ -218,12 +221,38 @@ describe('agentSteerQueueRouter.append', () => {
   });
 
   it.each([
-    [undefined, 'unavailable'],
+    ['notStored', 'unavailable'],
     ['full', 'full'],
   ] as const)('falls back to a direct send when append returns %s', async (result, reason) => {
     mocks.append.mockResolvedValue(result);
 
     await expect(caller().append(appendInput)).resolves.toEqual({ queued: false, reason });
+  });
+
+  it('sends directly where the deployment has no Redis at all', async () => {
+    mocks.isConfigured.mockReturnValue(false);
+    mocks.append.mockResolvedValue(undefined);
+
+    await expect(caller().append(appendInput)).resolves.toEqual({
+      queued: false,
+      reason: 'unavailable',
+    });
+  });
+
+  // ROOT CAUSE:
+  //
+  // A Redis outage (circuit open) looked like "not stored", so a retry of an
+  // append that had landed earlier was answered `unavailable` and sent by the
+  // client while the server still held the first copy.
+  //
+  // Before: no client meant "send directly".
+  // After: with Redis configured, no client is an unknown outcome.
+  it('answers unknown, not send-directly, while a configured Redis is out', async () => {
+    mocks.append.mockResolvedValue(undefined);
+
+    await expect(caller().append(appendInput)).rejects.toMatchObject({
+      code: 'SERVICE_UNAVAILABLE',
+    });
   });
 });
 
@@ -280,6 +309,30 @@ describe('agentSteerQueueRouter.list / remove', () => {
       }),
       expect.objectContaining({ delivering: false, id: 'mine' }),
     ]);
+  });
+
+  // ROOT CAUSE:
+  //
+  // Without a Redis client the entry's state is unknown, but the withdrawal
+  // answered `absent`: Delete reported success and Edit / Send now resent a
+  // follow-up the server could still deliver.
+  //
+  // Before: an outage read as "never stored".
+  // After: it is an error, so the client keeps the row and retries.
+  it('refuses to answer a withdrawal while Redis is out', async () => {
+    mocks.entryState.mockResolvedValue(undefined);
+
+    await expect(caller().remove({ id: 'mine', topicId: 'tpc-1' })).rejects.toMatchObject({
+      code: 'SERVICE_UNAVAILABLE',
+    });
+  });
+
+  it('refuses to list while Redis is out, rather than reporting an empty queue', async () => {
+    mocks.snapshot.mockRejectedValue(new Error('Redis is unavailable'));
+
+    await expect(caller().list({ topicId: 'tpc-1' })).rejects.toMatchObject({
+      code: 'SERVICE_UNAVAILABLE',
+    });
   });
 
   it.each([

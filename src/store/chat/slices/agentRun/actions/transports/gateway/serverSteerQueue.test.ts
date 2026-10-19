@@ -284,6 +284,34 @@ describe('server queue watch while a run delivers', () => {
     expect(queue()).toHaveLength(0);
   });
 
+  it('keeps every follow-up while the queue cannot be read, rather than taking them as delivered', async () => {
+    startRun();
+    vi.spyOn(aiAgentService, 'appendQueuedFollowUp').mockResolvedValue({
+      id: 'q1',
+      length: 1,
+      queued: true,
+    });
+    vi.spyOn(aiAgentService, 'listQueuedFollowUps').mockRejectedValue(
+      Object.assign(new Error('Queue unavailable'), { data: { code: 'SERVICE_UNAVAILABLE' } }),
+    );
+    get().enqueueMessage(key, queued('q1', { serverDelivery: 'appending' }));
+
+    await handOffQueuedMessage(get, key, context, 'q1', async () => request);
+    await vi.advanceTimersByTimeAsync(SERVER_QUEUE_POLL_MS * 3);
+
+    expect(queue()).toEqual([expect.objectContaining({ id: 'q1', serverDelivery: 'server' })]);
+  });
+
+  it('keeps the row and reports the failure when a withdrawal cannot reach the queue', async () => {
+    get().enqueueMessage(key, queued('q1', { serverDelivery: 'server', serverRequest: request }));
+    vi.spyOn(aiAgentService, 'removeQueuedFollowUp').mockRejectedValue(
+      Object.assign(new Error('Queue unavailable'), { data: { code: 'SERVICE_UNAVAILABLE' } }),
+    );
+
+    await expect(withdrawQueuedMessage(get, key, 'q1')).rejects.toThrow('Queue unavailable');
+    expect(queue()).toEqual([expect.objectContaining({ id: 'q1', serverDelivery: 'server' })]);
+  });
+
   it('keeps showing one it could not withdraw because a run is delivering it', async () => {
     get().enqueueMessage(key, queued('q1', { serverDelivery: 'server', serverRequest: request }));
     vi.spyOn(aiAgentService, 'removeQueuedFollowUp').mockResolvedValue({

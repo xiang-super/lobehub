@@ -43,6 +43,28 @@ const createFakeRedis = () => {
     const [key] = keys;
     const list = listOf(key);
 
+    if (script.includes('local delivering = {}')) {
+      reclaim(key, keys[1], Number(args[0]));
+      return [listOf(key), [...batchesOf(keys[1]).values()].flatMap((batch) => batch.items)];
+    }
+    if (script.includes("return 'absent'")) {
+      const [, takenKey, drainedKey] = keys;
+      const [id, mode, now] = args;
+      reclaim(key, drainedKey, Number(now));
+      const current = listOf(key);
+      const index = current.findIndex((item) => header(item).id === id);
+      if (index >= 0) {
+        if (mode !== 'remove') return 'queued';
+        current.splice(index, 1);
+        lists.set(key, current);
+        return 'removed';
+      }
+      const inBatch = [...batchesOf(drainedKey).values()].some((batch) =>
+        batch.items.some((item) => header(item).id === id),
+      );
+      if (inBatch) return 'delivering';
+      return setOf(takenKey).has(id) ? 'taken' : 'absent';
+    }
     if (script.includes('reclaimLapsed(KEYS[1], KEYS[3]')) {
       const [, , pkey] = keys;
       const [op, drainId, now, lease, , ...ended] = args;
@@ -81,23 +103,6 @@ const createFakeRedis = () => {
       return list.filter((item) => takes(item, op)).length + lapsed;
     }
     if (script.includes('return inFlight(KEYS[1])')) return inFlight(key);
-    if (script.includes('local delivering = {}'))
-      return [list, [...batchesOf(keys[1]).values()].flatMap((batch) => batch.items)];
-    if (script.includes("return 'absent'")) {
-      const [, takenKey, drainedKey] = keys;
-      const [id, mode] = args;
-      const index = list.findIndex((item) => header(item).id === id);
-      if (index >= 0) {
-        if (mode !== 'remove') return 'queued';
-        list.splice(index, 1);
-        return 'removed';
-      }
-      const inBatch = [...batchesOf(drainedKey).values()].some((batch) =>
-        batch.items.some((item) => header(item).id === id),
-      );
-      if (inBatch) return 'delivering';
-      return setOf(takenKey).has(id) ? 'taken' : 'absent';
-    }
     if (script.includes('SISMEMBER')) {
       const [id, item, ttl, max] = args;
       if (setOf(keys[1]).has(id)) return -2;
@@ -186,6 +191,38 @@ describe('redisService.steerQueue', () => {
     // `a` delivered.
     await q.settle(scope, 'd1');
     await expect(q.entryState(scope, 'a')).resolves.toBe('taken');
+  });
+
+  // ROOT CAUSE:
+  //
+  // A batch whose run crashed before settling stayed `delivering` after its
+  // lease lapsed, until a later drain reclaimed it: with no further run the
+  // user could neither withdraw nor resend it, and once the hash expired it
+  // read as delivered.
+  //
+  // Before: only a drain reclaimed lapsed batches.
+  // After: reading the queue or an entry's state reclaims them first.
+  it('returns a lapsed batch to the queue before reporting what is delivering', async () => {
+    vi.useFakeTimers();
+    await q.append(scope, entry('a'), 'op-1');
+    await q.drain(scope, 'op-1', [], 'd1');
+    vi.advanceTimersByTime(5 * 60 * 1000 + 1);
+
+    await expect(q.snapshot(scope)).resolves.toEqual({
+      delivering: [],
+      waiting: [expect.objectContaining({ id: 'a' })],
+    });
+
+    await q.drain(scope, 'op-2', [], 'd2');
+    vi.advanceTimersByTime(5 * 60 * 1000 + 1);
+    await expect(q.entryState(scope, 'a', { remove: true })).resolves.toBe('removed');
+  });
+
+  it('reports an outage instead of an empty queue', async () => {
+    getRedisServiceClient.mockResolvedValue(null);
+
+    await expect(q.snapshot(scope)).rejects.toThrow('unavailable');
+    await expect(q.entryState(scope, 'a')).resolves.toBeUndefined();
   });
 
   it('withdraws only a waiting entry, and says where any other one is', async () => {
@@ -316,7 +353,7 @@ describe('redisService.steerQueue', () => {
       throw new Error('command timed out');
     });
 
-    await expect(q.append(scope, entry('a'), 'op-1')).resolves.toBeUndefined();
+    await expect(q.append(scope, entry('a'), 'op-1')).resolves.toBe('notStored');
     expect(await ids()).toEqual([]);
   });
 
