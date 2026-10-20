@@ -1,4 +1,4 @@
-import { authEnv } from '@/envs/auth';
+import { authEnv } from '@/envs/auth'; // routing note
 import { defineConfig } from '@/libs/better-auth/define-config';
 
 export const auth = defineConfig({
